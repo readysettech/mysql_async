@@ -387,6 +387,8 @@ pub(crate) struct MysqlOpts {
     ///
     /// Note that compression level defined here will affect only outgoing packets.
     compression: Option<crate::Compression>,
+
+    capabilities: CapabilityFlags
 }
 
 /// Mysql connection options.
@@ -658,17 +660,7 @@ impl Opts {
     }
 
     pub(crate) fn get_capabilities(&self) -> CapabilityFlags {
-        let mut out = CapabilityFlags::CLIENT_PROTOCOL_41
-            | CapabilityFlags::CLIENT_SECURE_CONNECTION
-            | CapabilityFlags::CLIENT_LONG_PASSWORD
-            | CapabilityFlags::CLIENT_TRANSACTIONS
-            | CapabilityFlags::CLIENT_LOCAL_FILES
-            | CapabilityFlags::CLIENT_MULTI_STATEMENTS
-            | CapabilityFlags::CLIENT_MULTI_RESULTS
-            | CapabilityFlags::CLIENT_PS_MULTI_RESULTS
-            | CapabilityFlags::CLIENT_DEPRECATE_EOF
-            | CapabilityFlags::CLIENT_PLUGIN_AUTH;
-
+        let mut out = self.inner.mysql_opts.capabilities;
         if self.inner.mysql_opts.db_name.is_some() {
             out |= CapabilityFlags::CLIENT_CONNECT_WITH_DB;
         }
@@ -684,7 +676,19 @@ impl Opts {
 }
 
 impl Default for MysqlOpts {
+    
     fn default() -> MysqlOpts {
+        let default_caps = CapabilityFlags::CLIENT_PROTOCOL_41
+        | CapabilityFlags::CLIENT_SECURE_CONNECTION
+        | CapabilityFlags::CLIENT_LONG_PASSWORD
+        | CapabilityFlags::CLIENT_TRANSACTIONS
+        | CapabilityFlags::CLIENT_LOCAL_FILES
+        | CapabilityFlags::CLIENT_MULTI_STATEMENTS
+        | CapabilityFlags::CLIENT_MULTI_RESULTS
+        | CapabilityFlags::CLIENT_PS_MULTI_RESULTS
+        | CapabilityFlags::CLIENT_DEPRECATE_EOF
+        | CapabilityFlags::CLIENT_PLUGIN_AUTH;
+
         MysqlOpts {
             user: None,
             pass: None,
@@ -700,6 +704,7 @@ impl Default for MysqlOpts {
             prefer_socket: cfg!(not(target_os = "windows")),
             socket: None,
             compression: None,
+            capabilities:  default_caps
         }
     }
 }
@@ -906,6 +911,18 @@ impl OptsBuilder {
     /// Defines compression. See [`Opts::compression`].
     pub fn compression<T: Into<Option<crate::Compression>>>(mut self, compression: T) -> Self {
         self.opts.compression = compression.into();
+        self
+    }
+
+    /// Adds capability flag. See [`Opts::capabilities`].
+    pub fn add_capability(mut self, cap_flag: CapabilityFlags) -> Self {
+        self.opts.capabilities |= cap_flag;
+        self
+    }
+
+    /// Removes capability flag. See [`Opts::capabilities`].
+    pub fn remove_capability(mut self, cap_flag: CapabilityFlags) -> Self {
+        self.opts.capabilities &= !cap_flag;
         self
     }
 }
