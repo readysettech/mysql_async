@@ -405,6 +405,8 @@ pub(crate) struct MysqlOpts {
     ///
     /// Available via `secure_auth` connection url parameter.
     secure_auth: bool,
+
+    capabilities: CapabilityFlags,
 }
 
 /// Mysql connection options.
@@ -703,17 +705,7 @@ impl Opts {
     }
 
     pub(crate) fn get_capabilities(&self) -> CapabilityFlags {
-        let mut out = CapabilityFlags::CLIENT_PROTOCOL_41
-            | CapabilityFlags::CLIENT_SECURE_CONNECTION
-            | CapabilityFlags::CLIENT_LONG_PASSWORD
-            | CapabilityFlags::CLIENT_TRANSACTIONS
-            | CapabilityFlags::CLIENT_LOCAL_FILES
-            | CapabilityFlags::CLIENT_MULTI_STATEMENTS
-            | CapabilityFlags::CLIENT_MULTI_RESULTS
-            | CapabilityFlags::CLIENT_PS_MULTI_RESULTS
-            | CapabilityFlags::CLIENT_DEPRECATE_EOF
-            | CapabilityFlags::CLIENT_PLUGIN_AUTH;
-
+        let mut out = self.inner.mysql_opts.capabilities;
         if self.inner.mysql_opts.db_name.is_some() {
             out |= CapabilityFlags::CLIENT_CONNECT_WITH_DB;
         }
@@ -730,6 +722,17 @@ impl Opts {
 
 impl Default for MysqlOpts {
     fn default() -> MysqlOpts {
+        let default_caps = CapabilityFlags::CLIENT_PROTOCOL_41
+            | CapabilityFlags::CLIENT_SECURE_CONNECTION
+            | CapabilityFlags::CLIENT_LONG_PASSWORD
+            | CapabilityFlags::CLIENT_TRANSACTIONS
+            | CapabilityFlags::CLIENT_LOCAL_FILES
+            | CapabilityFlags::CLIENT_MULTI_STATEMENTS
+            | CapabilityFlags::CLIENT_MULTI_RESULTS
+            | CapabilityFlags::CLIENT_PS_MULTI_RESULTS
+            | CapabilityFlags::CLIENT_DEPRECATE_EOF
+            | CapabilityFlags::CLIENT_PLUGIN_AUTH;
+
         MysqlOpts {
             user: None,
             pass: None,
@@ -748,6 +751,7 @@ impl Default for MysqlOpts {
             max_allowed_packet: None,
             wait_timeout: None,
             secure_auth: true,
+            capabilities: default_caps,
         }
     }
 }
@@ -996,6 +1000,18 @@ impl OptsBuilder {
     /// Available via `secure_auth` connection url parameter.
     pub fn secure_auth(mut self, secure_auth: bool) -> Self {
         self.opts.secure_auth = secure_auth;
+        self
+    }
+
+    /// Adds capability flag. See [`Opts::capabilities`].
+    pub fn add_capability(mut self, cap_flag: CapabilityFlags) -> Self {
+        self.opts.capabilities |= cap_flag;
+        self
+    }
+
+    /// Removes capability flag. See [`Opts::capabilities`].
+    pub fn remove_capability(mut self, cap_flag: CapabilityFlags) -> Self {
+        self.opts.capabilities &= !cap_flag;
         self
     }
 }
