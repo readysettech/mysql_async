@@ -188,6 +188,27 @@ impl Conn {
             .unwrap_or_else(|| "".into())
     }
 
+    /// Session state change for SESSION_TRACK_GTIDS type as reported by the server
+    /// in the last OK packet
+    /// If called immediately after commit, should contain the GTID of the committed transaction.
+    pub fn session_state_changes_track_gtids(&self) -> Option<String> {
+        self.inner
+            .last_ok_packet
+            .as_ref()
+            .and_then(|ok| ok.session_state_info())
+            .and_then(|info| match info.data_type() {
+                mysql_common::constants::SessionStateType::SESSION_TRACK_GTIDS => info
+                    .decode()
+                    .map_or(None, |state_change| match state_change {
+                        mysql_common::packets::SessionStateChange::UnknownLayout(data) => {
+                            Some(String::from_utf8_lossy(data.as_ref()).to_string())
+                        }
+                        _ => None,
+                    }),
+                _ => None,
+            })
+    }
+
     /// Number of warnings, as reported by the server in the last OK packet, or `0`.
     pub fn get_warnings(&self) -> u16 {
         self.inner
@@ -802,6 +823,8 @@ impl Conn {
 
 #[cfg(test)]
 mod test {
+    use mysql_common::constants::CapabilityFlags;
+
     use crate::{
         from_row, params, prelude::*, test_misc::get_opts, Conn, Error, OptsBuilder, Pool, TxOpts,
         WhiteListFsLocalInfileHandler,
@@ -1401,6 +1424,38 @@ mod test {
         Ok(())
     }
 
+    // TODO(andrewtsakiris): In order to push these changes upstream, need to configure test DB
+    // to have proper GTID-enabled configuration. This test assumes relevant system variables are
+    // set properly on the server.
+    #[tokio::test]
+    async fn should_get_gtid_after_transaction() -> super::Result<()> {
+        let mut conn =
+            Conn::new(get_opts().add_capability(CapabilityFlags::CLIENT_SESSION_TRACK)).await?;
+
+        // Using Conn
+        conn.query_drop("DROP TABLE IF EXISTS gtid_test").await?;
+        conn.query_drop("CREATE TABLE gtid_test (id INT, name TEXT)")
+            .await?;
+        conn.query_drop("START TRANSACTION").await?;
+        conn.query_drop("INSERT INTO gtid_test VALUES (1, 'foo'), (2, 'bar')")
+            .await?;
+        conn.query_drop("COMMIT").await?;
+        let gtid = conn.session_state_changes_track_gtids();
+        assert!(gtid.is_some() && gtid.unwrap().contains(":")); // expecting "<server>:<txid>"
+
+        // Using Transaction
+        let mut transaction = conn.start_transaction(TxOpts::default()).await?;
+        transaction
+            .query_drop("INSERT INTO gtid_test VALUES (1, 'foo'), (2, 'bar')")
+            .await?;
+        let gtid = transaction.commit_returning_gtid().await?;
+        assert!(gtid.len() > 0 && gtid.contains(":"));
+
+        conn.query_drop("DROP TABLE gtid_test").await?;
+        conn.disconnect().await?;
+
+        Ok(())
+    }
     #[tokio::test]
     async fn should_run_transactions() -> super::Result<()> {
         let mut conn = Conn::new(get_opts()).await?;
