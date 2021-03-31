@@ -189,6 +189,15 @@ impl<'a> Transaction<'a> {
         self.0.set_tx_status(TxStatus::None);
         Ok(())
     }
+
+    /// Performs `COMMIT` query and returns GTID.
+    pub async fn commit_returning_gtid(mut self) -> Result<String> {
+        let result = self.0.query_iter("COMMIT").await?;
+        result.drop_result().await?;
+        self.0.set_tx_status(TxStatus::None);
+        let gtid = self.0.session_state_changes_track_gtids();
+        gtid.ok_or(Error::Other("GTID not found".into()))
+    }
 }
 
 impl Deref for Transaction<'_> {
