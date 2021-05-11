@@ -567,7 +567,7 @@ impl Conn {
         Ok(())
     }
 
-    pub(crate) async fn read_packet(&mut self) -> Result<Vec<u8>> {
+    pub async fn read_packet(&mut self) -> Result<Vec<u8>> {
         let packet = crate::io::ReadPacket::new(&mut *self)
             .await
             .map_err(|io_err| {
@@ -602,7 +602,7 @@ impl Conn {
     }
 
     /// Returns future that sends full command body to a server.
-    pub(crate) async fn write_command_raw(&mut self, body: Vec<u8>) -> Result<()> {
+    pub async fn write_command_raw(&mut self, body: Vec<u8>) -> Result<()> {
         debug_assert!(!body.is_empty());
         self.clean_dirty().await?;
         self.reset_seq_id();
@@ -610,7 +610,7 @@ impl Conn {
     }
 
     /// Returns future that writes command to a server.
-    pub(crate) async fn write_command_data<T>(&mut self, cmd: Command, cmd_data: T) -> Result<()>
+    pub async fn write_command_data<T>(&mut self, cmd: Command, cmd_data: T) -> Result<()>
     where
         T: AsRef<[u8]>,
     {
