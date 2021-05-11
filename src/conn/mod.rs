@@ -703,7 +703,7 @@ impl Conn {
         Ok(false)
     }
 
-    pub(crate) async fn read_packet(&mut self) -> Result<PooledBuf> {
+    pub async fn read_packet(&mut self) -> Result<PooledBuf> {
         loop {
             let packet = crate::io::ReadPacket::new(&mut *self)
                 .await
@@ -754,14 +754,14 @@ impl Conn {
     }
 
     /// Sends a command to a server.
-    pub(crate) async fn write_command<T: MySerialize>(&mut self, cmd: &T) -> Result<()> {
+    pub async fn write_command<T: MySerialize>(&mut self, cmd: &T) -> Result<()> {
         self.clean_dirty().await?;
         self.reset_seq_id();
         self.write_struct(cmd).await
     }
 
     /// Returns future that sends full command body to a server.
-    pub(crate) async fn write_command_raw(&mut self, body: PooledBuf) -> Result<()> {
+    pub async fn write_command_raw(&mut self, body: PooledBuf) -> Result<()> {
         debug_assert!(!body.is_empty());
         self.clean_dirty().await?;
         self.reset_seq_id();
@@ -769,7 +769,7 @@ impl Conn {
     }
 
     /// Returns future that writes command to a server.
-    pub(crate) async fn write_command_data<T>(&mut self, cmd: Command, cmd_data: T) -> Result<()>
+    pub async fn write_command_data<T>(&mut self, cmd: Command, cmd_data: T) -> Result<()>
     where
         T: AsRef<[u8]>,
     {
