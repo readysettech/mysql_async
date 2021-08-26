@@ -19,7 +19,7 @@ futures-sink = "0.3"
 lazy_static = "1"
 lru = "0.6.0"
 mio = "0.7.7"
-mysql_common = "0.26.0"
+mysql_common = { git = "https://github.com/readysettech/rust_mysql_common.git", branch = "peter/fix-it-on-top-of-old"}
 native-tls = "0.2"
 pem = "0.8.1"
 percent-encoding = "2.1.0"
