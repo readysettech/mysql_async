@@ -359,7 +359,7 @@ impl Conn {
     }
 
     /// Returns current status flags.
-    pub(crate) fn status(&self) -> StatusFlags {
+    pub fn status(&self) -> StatusFlags {
         self.inner.status
     }
 
