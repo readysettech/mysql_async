@@ -103,6 +103,23 @@ impl Decoder for PacketCodec {
             Ok(None)
         }
     }
+
+    fn decode_eof(&mut self, buf: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
+        match self.decode(buf)? {
+            Some(frame) => Ok(Some(frame)),
+            None => {
+                if buf.is_empty() {
+                    Ok(None)
+                } else {
+                    Err(io::Error::new(
+                        io::ErrorKind::Other,
+                        format!("bytes remaining on stream {:?}", buf),
+                    )
+                    .into())
+                }
+            }
+        }
+    }
 }
 
 impl Encoder<PooledBuf> for PacketCodec {
