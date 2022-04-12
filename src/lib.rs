@@ -111,8 +111,10 @@ mod queryable;
 
 type BoxFuture<'a, T> = futures_core::future::BoxFuture<'a, Result<T>>;
 
-static BUFFER_POOL: once_cell::sync::Lazy<Arc<crate::buffer_pool::BufferPool>> =
-    once_cell::sync::Lazy::new(|| Default::default());
+thread_local! {
+    static BUFFER_POOL: once_cell::sync::Lazy<Arc<crate::buffer_pool::BufferPool>> =
+        once_cell::sync::Lazy::new(Default::default);
+}
 
 #[doc(inline)]
 pub use self::conn::{binlog_stream::BinlogStream, Conn};
