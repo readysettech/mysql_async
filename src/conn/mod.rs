@@ -523,7 +523,7 @@ impl Conn {
         );
 
         // Serialize here to satisfy borrow checker.
-        let mut buf = crate::BUFFER_POOL.get();
+        let mut buf = crate::BUFFER_POOL.with(|p| p.get());
         handshake_response.serialize(buf.as_mut());
 
         self.write_packet(buf).await?;
@@ -557,7 +557,8 @@ impl Conn {
             if let Some(plugin_data) = plugin_data {
                 self.write_struct(&plugin_data).await?;
             } else {
-                self.write_packet(crate::BUFFER_POOL.get()).await?;
+                self.write_packet(crate::BUFFER_POOL.with(|p| p.get()))
+                    .await?;
             }
 
             self.continue_auth().await?;
@@ -617,7 +618,7 @@ impl Conn {
                 }
                 Some(0x04) => {
                     let pass = self.inner.opts.pass().unwrap_or_default();
-                    let mut pass = crate::BUFFER_POOL.get_with(pass.as_bytes());
+                    let mut pass = crate::BUFFER_POOL.with(|p| p.get_with(pass.as_bytes()));
                     pass.as_mut().push(0);
 
                     if self.is_secure() {
@@ -740,13 +741,13 @@ impl Conn {
 
     /// Writes bytes to a server.
     pub(crate) async fn write_bytes(&mut self, bytes: &[u8]) -> Result<()> {
-        let buf = crate::BUFFER_POOL.get_with(bytes);
+        let buf = crate::BUFFER_POOL.with(|p| p.get_with(bytes));
         self.write_packet(buf).await
     }
 
     /// Sends a serializable structure to a server.
     pub(crate) async fn write_struct<T: MySerialize>(&mut self, x: &T) -> Result<()> {
-        let mut buf = crate::BUFFER_POOL.get();
+        let mut buf = crate::BUFFER_POOL.with(|p| p.get());
         x.serialize(buf.as_mut());
         self.write_packet(buf).await
     }
@@ -772,7 +773,7 @@ impl Conn {
         T: AsRef<[u8]>,
     {
         let cmd_data = cmd_data.as_ref();
-        let mut buf = crate::BUFFER_POOL.get();
+        let mut buf = crate::BUFFER_POOL.with(|p| p.get());
         let body = buf.as_mut();
         body.push(cmd as u8);
         body.extend_from_slice(cmd_data);
