@@ -76,7 +76,7 @@ impl Future for Recycler {
                         $self.discard.push($conn.close_conn().boxed());
                     } else {
                         exchange.available.push_back($conn.into());
-                        if let Some(w) = exchange.waiting.pop_front() {
+                        if let Some(w) = exchange.waiting.pop() {
                             w.wake();
                         }
                     }
@@ -163,7 +163,7 @@ impl Future for Recycler {
             let mut exchange = self.inner.exchange.lock().unwrap();
             exchange.exist -= self.discarded;
             for _ in 0..self.discarded {
-                if let Some(w) = exchange.waiting.pop_front() {
+                if let Some(w) = exchange.waiting.pop() {
                     w.wake();
                 }
             }
@@ -197,7 +197,7 @@ impl Future for Recycler {
         if self.inner.closed.load(Ordering::Acquire) {
             // `DisconnectPool` might still wait to be woken up.
             let mut exchange = self.inner.exchange.lock().unwrap();
-            while let Some(w) = exchange.waiting.pop_front() {
+            while let Some(w) = exchange.waiting.pop() {
                 w.wake();
             }
             // we're about to exit, so there better be no outstanding connections

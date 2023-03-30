@@ -6,6 +6,15 @@
 // option. All files in the project carrying such notice may not be copied,
 // modified, or distributed except according to those terms.
 
+mod native_tls_opts;
+mod rustls_opts;
+
+#[cfg(feature = "native-tls")]
+pub use native_tls_opts::ClientIdentity;
+
+#[cfg(feature = "rustls-tls")]
+pub use rustls_opts::ClientIdentity;
+
 use percent_encoding::percent_decode;
 use url::{Host, Url};
 
@@ -109,29 +118,36 @@ impl HostPortOrUrl {
 /// ```
 /// # use mysql_async::SslOpts;
 /// # use std::path::Path;
+/// # #[cfg(any(feature = "native-tls-tls", feature = "rustls-tls"))]
+/// # use mysql_async::ClientIdentity;
+/// // With native-tls
+/// # #[cfg(feature = "native-tls-tls")]
 /// let ssl_opts = SslOpts::default()
-///     .with_pkcs12_path(Some(Path::new("/path")))
-///     .with_password(Some("******"));
+///     .with_client_identity(Some(ClientIdentity::new(Path::new("/path"))
+///         .with_password("******")
+///     ));
+///
+/// // With rustls
+/// # #[cfg(feature = "rustls-tls")]
+/// let ssl_opts = SslOpts::default()
+///     .with_client_identity(Some(ClientIdentity::new(
+///         Path::new("/path/to/chain"),
+///         Path::new("/path/to/priv_key")
+/// )));
 /// ```
 #[derive(Debug, Clone, Eq, PartialEq, Hash, Default)]
 pub struct SslOpts {
-    pkcs12_path: Option<Cow<'static, Path>>,
-    password: Option<Cow<'static, str>>,
+    #[cfg(any(feature = "native-tls", feature = "rustls-tls"))]
+    client_identity: Option<ClientIdentity>,
     root_cert_path: Option<Cow<'static, Path>>,
     skip_domain_validation: bool,
     accept_invalid_certs: bool,
 }
 
 impl SslOpts {
-    /// Sets path to the pkcs12 archive (in `der` format).
-    pub fn with_pkcs12_path<T: Into<Cow<'static, Path>>>(mut self, pkcs12_path: Option<T>) -> Self {
-        self.pkcs12_path = pkcs12_path.map(Into::into);
-        self
-    }
-
-    /// Sets the password for a pkcs12 archive (defaults to `None`).
-    pub fn with_password<T: Into<Cow<'static, str>>>(mut self, password: Option<T>) -> Self {
-        self.password = password.map(Into::into);
+    #[cfg(any(feature = "native-tls", feature = "rustls-tls"))]
+    pub fn with_client_identity(mut self, identity: Option<ClientIdentity>) -> Self {
+        self.client_identity = identity;
         self
     }
 
@@ -160,12 +176,9 @@ impl SslOpts {
         self
     }
 
-    pub fn pkcs12_path(&self) -> Option<&Path> {
-        self.pkcs12_path.as_ref().map(|x| x.as_ref())
-    }
-
-    pub fn password(&self) -> Option<&str> {
-        self.password.as_ref().map(AsRef::as_ref)
+    #[cfg(any(feature = "native-tls", feature = "rustls-tls"))]
+    pub fn client_identity(&self) -> Option<&ClientIdentity> {
+        self.client_identity.as_ref()
     }
 
     pub fn root_cert_path(&self) -> Option<&Path> {
@@ -393,6 +406,12 @@ pub(crate) struct MysqlOpts {
     secure_auth: bool,
 
     capabilities: CapabilityFlags,
+
+    /// Enables `CLIENT_FOUND_ROWS` capability (defaults to `false`).
+    ///
+    /// Changes the behavior of the affected count returned for writes (UPDATE/INSERT etc).
+    /// It makes MySQL return the FOUND rows instead of the AFFECTED rows.
+    client_found_rows: bool,
 }
 
 /// Mysql connection options.
@@ -597,7 +616,27 @@ impl Opts {
         self.inner.mysql_opts.stmt_cache_size
     }
 
-    /// Driver will require SSL connection if this opts isn't `None` (default to `None`).
+    /// Driver will require SSL connection if this opts isn't `None` (defaults to `None`).
+    ///
+    /// # Connection URL parameters
+    ///
+    /// Note that for securty reasons:
+    ///
+    /// * CA and IDENTITY verifications are opt-out
+    /// * there is no way to give an idenity or root certs via query URL
+    ///
+    /// URL Parameters:
+    ///
+    /// *   `require_ssl: bool` (defaults to `false`) – requires SSL with default [`SslOpts`]
+    /// *   `verify_ca: bool` (defaults to `true`) – requires server Certificate Authority (CA)
+    ///     certificate validation against the configured CA certificates.
+    ///     Makes no sence if  `require_ssl` equals `false`.
+    /// *   `verify_identity: bool` (defaults to `true`) – perform host name identity verification
+    ///     by checking the host name the client uses for connecting to the server against
+    ///     the identity in the certificate that the server sends to the client.
+    ///     Makes no sence if  `require_ssl` equals `false`.
+    ///
+    ///
     pub fn ssl_opts(&self) -> Option<&SslOpts> {
         self.inner.mysql_opts.ssl_opts.as_ref()
     }
@@ -690,6 +729,26 @@ impl Opts {
         self.inner.mysql_opts.secure_auth
     }
 
+    /// Returns `true` if `CLIENT_FOUND_ROWS` capability is enabled (defaults to `false`).
+    ///
+    /// `CLIENT_FOUND_ROWS` changes the behavior of the affected count returned for writes
+    /// (UPDATE/INSERT etc). It makes MySQL return the FOUND rows instead of the AFFECTED rows.
+    ///
+    /// # Connection URL
+    ///
+    /// Use `client_found_rows` URL parameter to set this value. E.g.
+    ///
+    /// ```
+    /// # use mysql_async::*;
+    /// # fn main() -> Result<()> {
+    /// let opts = Opts::from_url("mysql://localhost/db?client_found_rows=true")?;
+    /// assert!(opts.client_found_rows());
+    /// # Ok(()) }
+    /// ```
+    pub fn client_found_rows(&self) -> bool {
+        self.inner.mysql_opts.client_found_rows
+    }
+
     pub(crate) fn get_capabilities(&self) -> CapabilityFlags {
         let mut out = self.inner.mysql_opts.capabilities;
         if self.inner.mysql_opts.db_name.is_some() {
@@ -700,6 +759,9 @@ impl Opts {
         }
         if self.inner.mysql_opts.compression.is_some() {
             out |= CapabilityFlags::CLIENT_COMPRESS;
+        }
+        if self.client_found_rows() {
+            out |= CapabilityFlags::CLIENT_FOUND_ROWS;
         }
 
         out
@@ -738,6 +800,7 @@ impl Default for MysqlOpts {
             wait_timeout: None,
             secure_auth: true,
             capabilities: default_caps,
+            client_found_rows: false,
         }
     }
 }
@@ -1000,6 +1063,12 @@ impl OptsBuilder {
         self.opts.capabilities &= !cap_flag;
         self
     }
+
+    /// Enables or disables `CLIENT_FOUND_ROWS` capability. See [`Opts::client_found_rows`].
+    pub fn client_found_rows(mut self, client_found_rows: bool) -> Self {
+        self.opts.client_found_rows = client_found_rows;
+        self
+    }
 }
 
 impl From<OptsBuilder> for Opts {
@@ -1081,6 +1150,10 @@ fn mysqlopts_from_url(url: &Url) -> std::result::Result<MysqlOpts, UrlError> {
     let (mut opts, query_pairs): (MysqlOpts, _) = from_url_basic(url)?;
     let mut pool_min = DEFAULT_POOL_CONSTRAINTS.min;
     let mut pool_max = DEFAULT_POOL_CONSTRAINTS.max;
+
+    let mut skip_domain_validation = false;
+    let mut accept_invalid_certs = false;
+
     for (key, value) in query_pairs {
         if key == "pool_min" {
             match usize::from_str(&*value) {
@@ -1224,6 +1297,18 @@ fn mysqlopts_from_url(url: &Url) -> std::result::Result<MysqlOpts, UrlError> {
                     });
                 }
             }
+        } else if key == "client_found_rows" {
+            match bool::from_str(&*value) {
+                Ok(client_found_rows) => {
+                    opts.client_found_rows = client_found_rows;
+                }
+                _ => {
+                    return Err(UrlError::InvalidParamValue {
+                        param: "client_found_rows".into(),
+                        value,
+                    });
+                }
+            }
         } else if key == "socket" {
             opts.socket = Some(value)
         } else if key == "compression" {
@@ -1243,6 +1328,40 @@ fn mysqlopts_from_url(url: &Url) -> std::result::Result<MysqlOpts, UrlError> {
                     value,
                 });
             }
+        } else if key == "require_ssl" {
+            match bool::from_str(&*value) {
+                Ok(x) => opts.ssl_opts = x.then(SslOpts::default),
+                _ => {
+                    return Err(UrlError::InvalidParamValue {
+                        param: "require_ssl".into(),
+                        value,
+                    });
+                }
+            }
+        } else if key == "verify_ca" {
+            match bool::from_str(&*value) {
+                Ok(x) => {
+                    accept_invalid_certs = !x;
+                }
+                _ => {
+                    return Err(UrlError::InvalidParamValue {
+                        param: "verify_ca".into(),
+                        value,
+                    });
+                }
+            }
+        } else if key == "verify_identity" {
+            match bool::from_str(&*value) {
+                Ok(x) => {
+                    skip_domain_validation = !x;
+                }
+                _ => {
+                    return Err(UrlError::InvalidParamValue {
+                        param: "verify_identity".into(),
+                        value,
+                    });
+                }
+            }
         } else {
             return Err(UrlError::UnknownParameter { param: key });
         }
@@ -1255,6 +1374,11 @@ fn mysqlopts_from_url(url: &Url) -> std::result::Result<MysqlOpts, UrlError> {
             min: pool_min,
             max: pool_max,
         });
+    }
+
+    if let Some(ref mut ssl_opts) = opts.ssl_opts.as_mut() {
+        ssl_opts.accept_invalid_certs = accept_invalid_certs;
+        ssl_opts.skip_domain_validation = skip_domain_validation;
     }
 
     Ok(opts)
@@ -1279,7 +1403,7 @@ impl<'a> TryFrom<&'a str> for Opts {
 #[cfg(test)]
 mod test {
     use super::{HostPortOrUrl, MysqlOpts, Opts, Url};
-    use crate::error::UrlError::InvalidParamValue;
+    use crate::{error::UrlError::InvalidParamValue, SslOpts};
 
     use std::str::FromStr;
 
@@ -1346,6 +1470,41 @@ mod test {
         let opts = Opts::from_url(url).unwrap();
 
         assert_eq!(opts.ip_or_hostname(), "[::1]");
+    }
+
+    #[test]
+    fn should_parse_ssl_params() {
+        const URL1: &str = "mysql://localhost/foo?require_ssl=false";
+        let opts = Opts::from_url(URL1).unwrap();
+        assert_eq!(opts.ssl_opts(), None);
+
+        const URL2: &str = "mysql://localhost/foo?require_ssl=true";
+        let opts = Opts::from_url(URL2).unwrap();
+        assert_eq!(opts.ssl_opts(), Some(&SslOpts::default()));
+
+        const URL3: &str = "mysql://localhost/foo?require_ssl=true&verify_ca=false";
+        let opts = Opts::from_url(URL3).unwrap();
+        assert_eq!(
+            opts.ssl_opts(),
+            Some(&SslOpts::default().with_danger_accept_invalid_certs(true))
+        );
+
+        const URL4: &str =
+            "mysql://localhost/foo?require_ssl=true&verify_ca=false&verify_identity=false";
+        let opts = Opts::from_url(URL4).unwrap();
+        assert_eq!(
+            opts.ssl_opts(),
+            Some(
+                &SslOpts::default()
+                    .with_danger_accept_invalid_certs(true)
+                    .with_danger_skip_domain_validation(true)
+            )
+        );
+
+        const URL5: &str =
+            "mysql://localhost/foo?require_ssl=false&verify_ca=false&verify_identity=false";
+        let opts = Opts::from_url(URL5).unwrap();
+        assert_eq!(opts.ssl_opts(), None);
     }
 
     #[test]

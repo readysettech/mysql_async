@@ -14,9 +14,17 @@ use std::{
 };
 
 use futures_core::ready;
+#[cfg(feature = "tracing")]
+use {
+    std::sync::Arc,
+    tracing::{debug_span, Span},
+};
 
 use crate::{
-    conn::{pool::Pool, Conn},
+    conn::{
+        pool::{Pool, QueueId},
+        Conn,
+    },
     error::*,
 };
 
@@ -58,15 +66,21 @@ impl GetConnInner {
 #[derive(Debug)]
 #[must_use = "futures do nothing unless you `.await` or poll them"]
 pub struct GetConn {
+    pub(crate) queue_id: Option<QueueId>,
     pub(crate) pool: Option<Pool>,
     pub(crate) inner: GetConnInner,
+    #[cfg(feature = "tracing")]
+    span: Arc<Span>,
 }
 
 impl GetConn {
     pub(crate) fn new(pool: &Pool) -> GetConn {
         GetConn {
+            queue_id: None,
             pool: Some(pool.clone()),
             inner: GetConnInner::New,
+            #[cfg(feature = "tracing")]
+            span: Arc::new(debug_span!("mysql_async::get_conn")),
         }
     }
 
@@ -89,25 +103,32 @@ impl Future for GetConn {
     type Output = Result<Conn>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        #[cfg(feature = "tracing")]
+        let span = self.span.clone();
+        #[cfg(feature = "tracing")]
+        let _span_guard = span.enter();
         loop {
             match self.inner {
-                GetConnInner::New => match ready!(Pin::new(self.pool_mut()).poll_new_conn(cx))?
-                    .inner
-                    .take()
-                {
-                    GetConnInner::Connecting(conn_fut) => {
-                        self.inner = GetConnInner::Connecting(conn_fut);
+                GetConnInner::New => {
+                    let queued = self.queue_id.is_some();
+                    let queue_id = *self.queue_id.get_or_insert_with(QueueId::next);
+                    let next =
+                        ready!(Pin::new(self.pool_mut()).poll_new_conn(cx, queued, queue_id))?;
+                    match next {
+                        GetConnInner::Connecting(conn_fut) => {
+                            self.inner = GetConnInner::Connecting(conn_fut);
+                        }
+                        GetConnInner::Checking(conn_fut) => {
+                            self.inner = GetConnInner::Checking(conn_fut);
+                        }
+                        GetConnInner::Done => unreachable!(
+                            "Pool::poll_new_conn never gives out already-consumed GetConns"
+                        ),
+                        GetConnInner::New => {
+                            unreachable!("Pool::poll_new_conn never gives out GetConnInner::New")
+                        }
                     }
-                    GetConnInner::Checking(conn_fut) => {
-                        self.inner = GetConnInner::Checking(conn_fut);
-                    }
-                    GetConnInner::Done => unreachable!(
-                        "Pool::poll_new_conn never gives out already-consumed GetConns"
-                    ),
-                    GetConnInner::New => {
-                        unreachable!("Pool::poll_new_conn never gives out GetConnInner::New")
-                    }
-                },
+                }
                 GetConnInner::Done => {
                     unreachable!("GetConn::poll polled after returning Async::Ready");
                 }
@@ -158,6 +179,11 @@ impl Drop for GetConn {
         // We drop a connection before it can be resolved, a.k.a. cancelling it.
         // Make sure we maintain the necessary invariants towards the pool.
         if let Some(pool) = self.pool.take() {
+            // Remove the waker from the pool's waitlist in case this task was
+            // woken by another waker, like from tokio::time::timeout.
+            if let Some(queue_id) = self.queue_id {
+                pool.unqueue(queue_id);
+            }
             if let GetConnInner::Connecting(..) = self.inner.take() {
                 pool.cancel_connection();
             }
