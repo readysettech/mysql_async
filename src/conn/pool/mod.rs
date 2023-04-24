@@ -7,14 +7,12 @@
 // modified, or distributed except according to those terms.
 
 use futures_util::FutureExt;
-use priority_queue::PriorityQueue;
 use tokio::sync::mpsc;
 
 use std::{
     cmp::{Ordering, Reverse},
-    collections::VecDeque,
+    collections::{BinaryHeap, VecDeque},
     convert::TryFrom,
-    hash::{Hash, Hasher},
     pin::Pin,
     str::FromStr,
     sync::{atomic, Arc, Mutex},
@@ -65,7 +63,7 @@ impl From<Conn> for IdlingConn {
 /// This is fine as long as we never do expensive work while holding the lock!
 #[derive(Debug)]
 struct Exchange {
-    waiting: Waitlist,
+    waiting: BinaryHeap<QueuedWaker>,
     available: VecDeque<IdlingConn>,
     exist: usize,
     // only used to spawn the recycler the first time we're in async context
@@ -90,45 +88,9 @@ impl Exchange {
     }
 }
 
-#[derive(Default, Debug)]
-struct Waitlist {
-    queue: PriorityQueue<QueuedWaker, QueueId>,
-}
-
-impl Waitlist {
-    fn push(&mut self, w: Waker, queue_id: QueueId) {
-        self.queue.push(
-            QueuedWaker {
-                queue_id,
-                waker: Some(w),
-            },
-            queue_id,
-        );
-    }
-
-    fn pop(&mut self) -> Option<Waker> {
-        match self.queue.pop() {
-            Some((qw, _)) => Some(qw.waker.unwrap()),
-            None => None,
-        }
-    }
-
-    fn remove(&mut self, id: QueueId) {
-        let tmp = QueuedWaker {
-            queue_id: id,
-            waker: None,
-        };
-        self.queue.remove(&tmp);
-    }
-
-    fn is_empty(&self) -> bool {
-        self.queue.is_empty()
-    }
-}
-
 const QUEUE_END_ID: QueueId = QueueId(Reverse(u64::MAX));
 
-#[derive(Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd)]
 pub(crate) struct QueueId(Reverse<u64>);
 
 impl QueueId {
@@ -142,7 +104,13 @@ impl QueueId {
 #[derive(Debug)]
 struct QueuedWaker {
     queue_id: QueueId,
-    waker: Option<Waker>,
+    waker: Waker,
+}
+
+impl QueuedWaker {
+    fn new(queue_id: QueueId, waker: Waker) -> Self {
+        QueuedWaker { queue_id, waker }
+    }
 }
 
 impl Eq for QueuedWaker {}
@@ -162,12 +130,6 @@ impl Ord for QueuedWaker {
 impl PartialOrd for QueuedWaker {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
-    }
-}
-
-impl Hash for QueuedWaker {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.queue_id.hash(state)
     }
 }
 
@@ -215,7 +177,7 @@ impl Pool {
                 closed: false.into(),
                 exchange: Mutex::new(Exchange {
                     available: VecDeque::with_capacity(pool_opts.constraints().max()),
-                    waiting: Waitlist::default(),
+                    waiting: BinaryHeap::new(),
                     exist: 0,
                     recycler: Some((rx, pool_opts)),
                 }),
@@ -265,8 +227,8 @@ impl Pool {
             let mut exchange = self.inner.exchange.lock().unwrap();
             if exchange.available.len() < self.opts.pool_opts().active_bound() {
                 exchange.available.push_back(conn.into());
-                if let Some(w) = exchange.waiting.pop() {
-                    w.wake();
+                if let Some(qw) = exchange.waiting.pop() {
+                    qw.waker.wake();
                 }
                 return;
             }
@@ -300,8 +262,8 @@ impl Pool {
         let mut exchange = self.inner.exchange.lock().unwrap();
         exchange.exist -= 1;
         // we just enabled the creation of a new connection!
-        if let Some(w) = exchange.waiting.pop() {
-            w.wake();
+        if let Some(qw) = exchange.waiting.pop() {
+            qw.waker.wake();
         }
     }
 
@@ -334,7 +296,9 @@ impl Pool {
 
         // Check if others are waiting and we're not queued.
         if !exchange.waiting.is_empty() && !queued {
-            exchange.waiting.push(cx.waker().clone(), queue_id);
+            exchange
+                .waiting
+                .push(QueuedWaker::new(queue_id, cx.waker().clone()));
             return Poll::Pending;
         }
 
@@ -364,13 +328,10 @@ impl Pool {
         }
 
         // Polled, but no conn available? Back into the queue.
-        exchange.waiting.push(cx.waker().clone(), queue_id);
+        exchange
+            .waiting
+            .push(QueuedWaker::new(queue_id, cx.waker().clone()));
         Poll::Pending
-    }
-
-    fn unqueue(&self, queue_id: QueueId) {
-        let mut exchange = self.inner.exchange.lock().unwrap();
-        exchange.waiting.remove(queue_id);
     }
 }
 
@@ -402,20 +363,12 @@ mod test {
         try_join, FutureExt,
     };
     use mysql_common::row::Row;
-    use tokio::time::{sleep, timeout};
+    use tokio::time::sleep;
 
-    use std::{
-        cmp::Reverse,
-        task::{RawWaker, RawWakerVTable, Waker},
-        time::Duration,
-    };
+    use std::time::Duration;
 
     use crate::{
-        conn::pool::{Pool, QueueId, Waitlist, QUEUE_END_ID},
-        opts::PoolOpts,
-        prelude::*,
-        test_misc::get_opts,
-        PoolConstraints, TxOpts,
+        conn::pool::Pool, opts::PoolOpts, prelude::*, test_misc::get_opts, PoolConstraints, TxOpts,
     };
 
     macro_rules! conn_ex_field {
@@ -872,27 +825,6 @@ mod test {
     }
 
     #[tokio::test]
-    async fn should_remove_waker_of_cancelled_task() {
-        let pool_constraints = PoolConstraints::new(1, 1).unwrap();
-        let pool_opts = PoolOpts::default().with_constraints(pool_constraints);
-
-        let pool = Pool::new(get_opts().pool_opts(pool_opts));
-        let only_conn = pool.get_conn().await.unwrap();
-
-        let join_handle = tokio::spawn(timeout(Duration::from_secs(1), pool.get_conn()));
-
-        sleep(Duration::from_secs(2)).await;
-
-        match join_handle.await.unwrap() {
-            Err(_elapsed) => (),
-            _ => panic!("unexpected Ok()"),
-        }
-        drop(only_conn);
-
-        assert_eq!(0, pool.inner.exchange.lock().unwrap().waiting.queue.len());
-    }
-
-    #[tokio::test]
     async fn should_work_if_pooled_connection_operation_is_cancelled() -> super::Result<()> {
         let pool = Pool::new(get_opts());
 
@@ -934,40 +866,6 @@ mod test {
             sleep(Duration::from_millis(100)).await;
         }
         Ok(())
-    }
-
-    #[test]
-    fn waitlist_integrity() {
-        const DATA: *const () = &();
-        const NOOP_CLONE_FN: unsafe fn(*const ()) -> RawWaker = |_| RawWaker::new(DATA, &RW_VTABLE);
-        const NOOP_FN: unsafe fn(*const ()) = |_| {};
-        static RW_VTABLE: RawWakerVTable =
-            RawWakerVTable::new(NOOP_CLONE_FN, NOOP_FN, NOOP_FN, NOOP_FN);
-        let w = unsafe { Waker::from_raw(RawWaker::new(DATA, &RW_VTABLE)) };
-
-        let mut waitlist = Waitlist::default();
-        assert_eq!(0, waitlist.queue.len());
-
-        waitlist.push(w.clone(), QueueId(Reverse(4)));
-        waitlist.push(w.clone(), QueueId(Reverse(2)));
-        waitlist.push(w.clone(), QueueId(Reverse(8)));
-        waitlist.push(w.clone(), QUEUE_END_ID);
-        waitlist.push(w.clone(), QueueId(Reverse(10)));
-
-        waitlist.remove(QueueId(Reverse(8)));
-
-        assert_eq!(4, waitlist.queue.len());
-
-        let (_, id) = waitlist.queue.pop().unwrap();
-        assert_eq!(2, id.0 .0);
-        let (_, id) = waitlist.queue.pop().unwrap();
-        assert_eq!(4, id.0 .0);
-        let (_, id) = waitlist.queue.pop().unwrap();
-        assert_eq!(10, id.0 .0);
-        let (_, id) = waitlist.queue.pop().unwrap();
-        assert_eq!(QUEUE_END_ID, id);
-
-        assert_eq!(0, waitlist.queue.len());
     }
 
     #[cfg(feature = "nightly")]
