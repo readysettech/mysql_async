@@ -7,7 +7,7 @@
 // modified, or distributed except according to those terms.
 
 use futures_util::FutureExt;
-use priority_queue::PriorityQueue;
+use keyed_priority_queue::KeyedPriorityQueue;
 use tokio::sync::mpsc;
 
 use std::{
@@ -26,7 +26,7 @@ use crate::{
     conn::{pool::futures::*, Conn},
     error::*,
     opts::{Opts, PoolOpts},
-    queryable::transaction::{Transaction, TxOpts, TxStatus},
+    queryable::transaction::{Transaction, TxOpts},
 };
 
 mod recycler;
@@ -92,7 +92,7 @@ impl Exchange {
 
 #[derive(Default, Debug)]
 struct Waitlist {
-    queue: PriorityQueue<QueuedWaker, QueueId>,
+    queue: KeyedPriorityQueue<QueuedWaker, QueueId>,
 }
 
 impl Waitlist {
@@ -232,7 +232,8 @@ impl Pool {
 
     /// Async function that resolves to `Conn`.
     pub fn get_conn(&self) -> GetConn {
-        GetConn::new(self)
+        let reset_connection = self.opts.pool_opts().reset_connection();
+        GetConn::new(self, reset_connection)
     }
 
     /// Starts a new transaction.
@@ -253,25 +254,6 @@ impl Pool {
     fn return_conn(&mut self, conn: Conn) {
         // NOTE: we're not in async context here, so we can't block or return NotReady
         // any and all cleanup work _has_ to be done in the spawned recycler
-
-        // fast-path for when the connection is immediately ready to be reused
-        if conn.inner.stream.is_some()
-            && !conn.inner.disconnected
-            && !conn.expired()
-            && conn.inner.tx_status == TxStatus::None
-            && !conn.has_pending_result()
-            && !self.inner.close.load(atomic::Ordering::Acquire)
-        {
-            let mut exchange = self.inner.exchange.lock().unwrap();
-            if exchange.available.len() < self.opts.pool_opts().active_bound() {
-                exchange.available.push_back(conn.into());
-                if let Some(w) = exchange.waiting.pop() {
-                    w.wake();
-                }
-                return;
-            }
-        }
-
         self.send_to_recycler(conn);
     }
 
@@ -296,7 +278,7 @@ impl Pool {
     ///
     /// Decreases the exist counter since a broken or dropped connection should not count towards
     /// the total.
-    fn cancel_connection(&self) {
+    pub(super) fn cancel_connection(&self) {
         let mut exchange = self.inner.exchange.lock().unwrap();
         exchange.exist -= 1;
         // we just enabled the creation of a new connection!
@@ -401,7 +383,6 @@ mod test {
         future::{join_all, select, select_all, try_join_all},
         try_join, FutureExt,
     };
-    use mysql_common::row::Row;
     use tokio::time::{sleep, timeout};
 
     use std::{
@@ -415,7 +396,7 @@ mod test {
         opts::PoolOpts,
         prelude::*,
         test_misc::get_opts,
-        PoolConstraints, TxOpts,
+        PoolConstraints, Row, TxOpts, Value,
     };
 
     macro_rules! conn_ex_field {
@@ -428,6 +409,55 @@ mod test {
         ($pool:expr, $field:tt) => {
             $pool.inner.exchange.lock().unwrap().$field
         };
+    }
+
+    #[tokio::test]
+    async fn should_opt_out_of_connection_reset() -> super::Result<()> {
+        let pool_opts = PoolOpts::new().with_constraints(PoolConstraints::new(1, 1).unwrap());
+        let opts = get_opts().pool_opts(pool_opts.clone());
+
+        let pool = Pool::new(opts.clone());
+
+        let mut conn = pool.get_conn().await.unwrap();
+        assert_eq!(
+            conn.query_first::<Value, _>("SELECT @foo").await?.unwrap(),
+            Value::NULL
+        );
+        conn.query_drop("SET @foo = 'foo'").await?;
+        assert_eq!(
+            conn.query_first::<String, _>("SELECT @foo").await?.unwrap(),
+            "foo",
+        );
+        drop(conn);
+
+        conn = pool.get_conn().await.unwrap();
+        assert_eq!(
+            conn.query_first::<Value, _>("SELECT @foo").await?.unwrap(),
+            Value::NULL
+        );
+        conn.query_drop("SET @foo = 'foo'").await?;
+        conn.reset_connection(false);
+        drop(conn);
+
+        conn = pool.get_conn().await.unwrap();
+        assert_eq!(
+            conn.query_first::<String, _>("SELECT @foo").await?.unwrap(),
+            "foo",
+        );
+        drop(conn);
+        pool.disconnect().await.unwrap();
+
+        let pool = Pool::new(opts.pool_opts(pool_opts.with_reset_connection(false)));
+        conn = pool.get_conn().await.unwrap();
+        conn.query_drop("SET @foo = 'foo'").await?;
+        drop(conn);
+        conn = pool.get_conn().await.unwrap();
+        assert_eq!(
+            conn.query_first::<String, _>("SELECT @foo").await?.unwrap(),
+            "foo",
+        );
+        drop(conn);
+        pool.disconnect().await
     }
 
     #[test]
@@ -461,7 +491,7 @@ mod test {
 
     #[tokio::test]
     async fn should_connect() -> super::Result<()> {
-        let pool = Pool::new(get_opts());
+        let pool = Pool::new(crate::Opts::from(get_opts()));
         pool.get_conn().await?.ping().await?;
         pool.disconnect().await?;
         Ok(())
@@ -491,6 +521,9 @@ mod test {
                 .into_iter()
                 .map(|conn| conn.id())
                 .collect::<Vec<_>>();
+
+            // give some time to reset connections
+            sleep(Duration::from_millis(1000)).await;
 
             // get_conn should work if connection is available and alive
             pool.get_conn().await?;
@@ -573,20 +606,29 @@ mod test {
 
         let pool = Pool::new(opts);
 
-        "CREATE TEMPORARY TABLE tmp(id int)".ignore(&pool).await?;
+        "CREATE TABLE IF NOT EXISTS mysql.tmp(id int)"
+            .ignore(&pool)
+            .await?;
+        "DELETE FROM mysql.tmp".ignore(&pool).await?;
 
         let mut tx = pool.start_transaction(TxOpts::default()).await?;
-        tx.exec_batch("INSERT INTO tmp (id) VALUES (?)", vec![(1_u8,), (2_u8,)])
-            .await?;
-        tx.exec_drop("SELECT * FROM tmp", ()).await?;
+        tx.exec_batch(
+            "INSERT INTO mysql.tmp (id) VALUES (?)",
+            vec![(1_u8,), (2_u8,)],
+        )
+        .await?;
+        tx.exec_drop("SELECT * FROM mysql.tmp", ()).await?;
         drop(tx);
         let row_opt = pool
             .get_conn()
             .await?
-            .query_first("SELECT COUNT(*) FROM tmp")
+            .query_first("SELECT COUNT(*) FROM mysql.tmp")
             .await?;
         assert_eq!(row_opt, Some((0u8,)));
-        pool.get_conn().await?.query_drop("DROP TABLE tmp").await?;
+        pool.get_conn()
+            .await?
+            .query_drop("DROP TABLE mysql.tmp")
+            .await?;
         pool.disconnect().await?;
         Ok(())
     }
@@ -657,7 +699,7 @@ mod test {
             let _ = conns.pop();
 
             // then, wait for a bit to let the connection be reclaimed
-            sleep(Duration::from_millis(50)).await;
+            sleep(Duration::from_millis(500)).await;
 
             // now check that we have the expected # of connections
             // this may look a little funky, but think of it this way:

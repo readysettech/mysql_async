@@ -21,6 +21,7 @@ use url::{Host, Url};
 use std::{
     borrow::Cow,
     convert::TryFrom,
+    fmt,
     net::{Ipv4Addr, Ipv6Addr},
     path::Path,
     str::FromStr,
@@ -208,9 +209,15 @@ pub struct PoolOpts {
     constraints: PoolConstraints,
     inactive_connection_ttl: Duration,
     ttl_check_interval: Duration,
+    reset_connection: bool,
 }
 
 impl PoolOpts {
+    /// Calls `Self::default`.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
     /// Creates the default [`PoolOpts`] with the given constraints.
     pub fn with_constraints(mut self, constraints: PoolConstraints) -> Self {
         self.constraints = constraints;
@@ -220,6 +227,50 @@ impl PoolOpts {
     /// Returns pool constraints.
     pub fn constraints(&self) -> PoolConstraints {
         self.constraints
+    }
+
+    /// Sets whether to reset connection upon returning it to a pool (defaults to `true`).
+    ///
+    /// Default behavior increases reliability but comes with cons:
+    ///
+    /// * reset procedure removes all prepared statements, i.e. kills prepared statements cache
+    /// * connection reset is quite fast but requires additional client-server roundtrip
+    ///   (might also requires requthentication for older servers)
+    ///
+    /// The purpose of the reset procedure is to:
+    ///
+    /// * rollback any opened transactions (`mysql_async` is able to do this without explicit reset)
+    /// * reset transaction isolation level
+    /// * reset session variables
+    /// * delete user variables
+    /// * remove temporary tables
+    /// * remove all PREPARE statement (this action kills prepared statements cache)
+    ///
+    /// So to encrease overall performance you can safely opt-out of the default behavior
+    /// if you are not willing to change the session state in an unpleasant way.
+    ///
+    /// It is also possible to selectively opt-in/out using [`Conn::reset_connection`].
+    ///
+    /// # Connection URL
+    ///
+    /// You can use `reset_connection` URL parameter to set this value. E.g.
+    ///
+    /// ```
+    /// # use mysql_async::*;
+    /// # use std::time::Duration;
+    /// # fn main() -> Result<()> {
+    /// let opts = Opts::from_url("mysql://localhost/db?reset_connection=false")?;
+    /// assert_eq!(opts.pool_opts().reset_connection(), false);
+    /// # Ok(()) }
+    /// ```
+    pub fn with_reset_connection(mut self, reset_connection: bool) -> Self {
+        self.reset_connection = reset_connection;
+        self
+    }
+
+    /// Returns the `reset_connection` value (see [`PoolOpts::with_reset_connection`]).
+    pub fn reset_connection(&self) -> bool {
+        self.reset_connection
     }
 
     /// Pool will recycle inactive connection if it is outside of the lower bound of the pool
@@ -308,6 +359,7 @@ impl Default for PoolOpts {
             constraints: DEFAULT_POOL_CONSTRAINTS,
             inactive_connection_ttl: DEFAULT_INACTIVE_CONNECTION_TTL,
             ttl_check_interval: DEFAULT_TTL_CHECK_INTERVAL,
+            reset_connection: true,
         }
     }
 }
@@ -351,8 +403,12 @@ pub(crate) struct MysqlOpts {
     /// (defaults to `wait_timeout`).
     conn_ttl: Option<Duration>,
 
-    /// Commands to execute on each new database connection.
+    /// Commands to execute once new connection is established.
     init: Vec<String>,
+
+    /// Commands to execute on new connection and every time
+    /// [`Conn::reset`] or [`Conn::change_user`] is invoked.
+    setup: Vec<String>,
 
     /// Number of prepared statements cached on the client side (per connection). Defaults to `10`.
     stmt_cache_size: usize,
@@ -412,6 +468,17 @@ pub(crate) struct MysqlOpts {
     /// Changes the behavior of the affected count returned for writes (UPDATE/INSERT etc).
     /// It makes MySQL return the FOUND rows instead of the AFFECTED rows.
     client_found_rows: bool,
+
+    /// Enables Client-Side Cleartext Pluggable Authentication (defaults to `false`).
+    ///
+    /// Enables client to send passwords to the server as cleartext, without hashing or encryption
+    /// (consult MySql documentation for more info).
+    ///
+    /// # Security Notes
+    ///
+    /// Sending passwords as cleartext may be a security problem in some configurations. Please
+    /// consider using TLS or encrypted tunnels for server connection.
+    enable_cleartext_plugin: bool,
 }
 
 /// Mysql connection options.
@@ -516,9 +583,15 @@ impl Opts {
         self.inner.mysql_opts.db_name.as_ref().map(AsRef::as_ref)
     }
 
-    /// Commands to execute on each new database connection.
+    /// Commands to execute once new connection is established.
     pub fn init(&self) -> &[String] {
         self.inner.mysql_opts.init.as_ref()
+    }
+
+    /// Commands to execute on new connection and every time
+    /// [`Conn::reset`] or [`Conn::change_user`] is invoked.
+    pub fn setup(&self) -> &[String] {
+        self.inner.mysql_opts.setup.as_ref()
     }
 
     /// TCP keep alive timeout in milliseconds (defaults to `None`).
@@ -749,6 +822,31 @@ impl Opts {
         self.inner.mysql_opts.client_found_rows
     }
 
+    /// Returns `true` if `mysql_clear_password` plugin support is enabled (defaults to `false`).
+    ///
+    /// `mysql_clear_password` enables client to send passwords to the server as cleartext, without
+    /// hashing or encryption (consult MySql documentation for more info).
+    ///
+    /// # Security Notes
+    ///
+    /// Sending passwords as cleartext may be a security problem in some configurations. Please
+    /// consider using TLS or encrypted tunnels for server connection.
+    ///
+    /// # Connection URL
+    ///
+    /// Use `enable_cleartext_plugin` URL parameter to set this value. E.g.
+    ///
+    /// ```
+    /// # use mysql_async::*;
+    /// # fn main() -> Result<()> {
+    /// let opts = Opts::from_url("mysql://localhost/db?enable_cleartext_plugin=true")?;
+    /// assert!(opts.enable_cleartext_plugin());
+    /// # Ok(()) }
+    /// ```
+    pub fn enable_cleartext_plugin(&self) -> bool {
+        self.inner.mysql_opts.enable_cleartext_plugin
+    }
+
     pub(crate) fn get_capabilities(&self) -> CapabilityFlags {
         let mut out = self.inner.mysql_opts.capabilities;
         if self.inner.mysql_opts.db_name.is_some() {
@@ -786,6 +884,7 @@ impl Default for MysqlOpts {
             pass: None,
             db_name: None,
             init: vec![],
+            setup: vec![],
             tcp_keepalive: None,
             tcp_nodelay: true,
             local_infile_handler: None,
@@ -801,6 +900,7 @@ impl Default for MysqlOpts {
             secure_auth: true,
             capabilities: default_caps,
             client_found_rows: false,
+            enable_cleartext_plugin: false,
         }
     }
 }
@@ -952,6 +1052,12 @@ impl OptsBuilder {
         self
     }
 
+    /// Defines setup queries. See [`Opts::setup`].
+    pub fn setup<T: Into<String>>(mut self, setup: Vec<T>) -> Self {
+        self.opts.setup = setup.into_iter().map(Into::into).collect();
+        self
+    }
+
     /// Defines `tcp_keepalive` option. See [`Opts::tcp_keepalive`].
     pub fn tcp_keepalive<T: Into<u32>>(mut self, tcp_keepalive: Option<T>) -> Self {
         self.opts.tcp_keepalive = tcp_keepalive.map(Into::into);
@@ -1069,6 +1175,32 @@ impl OptsBuilder {
         self.opts.client_found_rows = client_found_rows;
         self
     }
+
+    /// Enables Client-Side Cleartext Pluggable Authentication (defaults to `false`).
+    ///
+    /// Enables client to send passwords to the server as cleartext, without hashing or encryption
+    /// (consult MySql documentation for more info).
+    ///
+    /// # Security Notes
+    ///
+    /// Sending passwords as cleartext may be a security problem in some configurations. Please
+    /// consider using TLS or encrypted tunnels for server connection.
+    ///
+    /// # Connection URL
+    ///
+    /// Use `enable_cleartext_plugin` URL parameter to set this value. E.g.
+    ///
+    /// ```
+    /// # use mysql_async::*;
+    /// # fn main() -> Result<()> {
+    /// let opts = Opts::from_url("mysql://localhost/db?enable_cleartext_plugin=true")?;
+    /// assert!(opts.enable_cleartext_plugin());
+    /// # Ok(()) }
+    /// ```
+    pub fn enable_cleartext_plugin(mut self, enable_cleartext_plugin: bool) -> Self {
+        self.opts.enable_cleartext_plugin = enable_cleartext_plugin;
+        self
+    }
 }
 
 impl From<OptsBuilder> for Opts {
@@ -1082,6 +1214,118 @@ impl From<OptsBuilder> for Opts {
         Opts {
             inner: Arc::new(inner_opts),
         }
+    }
+}
+
+/// [`COM_CHANGE_USER`][1] options.
+///
+/// Connection [`Opts`] are going to be updated accordingly upon `COM_CHANGE_USER`.
+///
+/// [`Opts`] won't be updated by default, because default `ChangeUserOpts` will reuse
+/// connection's `user`, `pass` and `db_name`.
+///
+/// [1]: https://dev.mysql.com/doc/c-api/5.7/en/mysql-change-user.html
+#[derive(Clone, Eq, PartialEq)]
+pub struct ChangeUserOpts {
+    user: Option<Option<String>>,
+    pass: Option<Option<String>>,
+    db_name: Option<Option<String>>,
+}
+
+impl ChangeUserOpts {
+    pub(crate) fn update_opts(self, opts: &mut Opts) {
+        if self.user.is_none() && self.pass.is_none() && self.db_name.is_none() {
+            return;
+        }
+
+        let mut builder = OptsBuilder::from_opts(opts.clone());
+
+        if let Some(user) = self.user {
+            builder = builder.user(user);
+        }
+
+        if let Some(pass) = self.pass {
+            builder = builder.pass(pass);
+        }
+
+        if let Some(db_name) = self.db_name {
+            builder = builder.db_name(db_name);
+        }
+
+        *opts = Opts::from(builder);
+    }
+
+    /// Creates change user options that'll reuse connection options.
+    pub fn new() -> Self {
+        Self {
+            user: None,
+            pass: None,
+            db_name: None,
+        }
+    }
+
+    /// Set [`Opts::user`] to the given value.
+    pub fn with_user(mut self, user: Option<String>) -> Self {
+        self.user = Some(user);
+        self
+    }
+
+    /// Set [`Opts::pass`] to the given value.
+    pub fn with_pass(mut self, pass: Option<String>) -> Self {
+        self.pass = Some(pass);
+        self
+    }
+
+    /// Set [`Opts::db_name`] to the given value.
+    pub fn with_db_name(mut self, db_name: Option<String>) -> Self {
+        self.db_name = Some(db_name);
+        self
+    }
+
+    /// Returns user.
+    ///
+    /// * if `None` then `self` does not meant to change user
+    /// * if `Some(None)` then `self` will clear user
+    /// * if `Some(Some(_))` then `self` will change user
+    pub fn user(&self) -> Option<Option<&str>> {
+        self.user.as_ref().map(|x| x.as_deref())
+    }
+
+    /// Returns password.
+    ///
+    /// * if `None` then `self` does not meant to change password
+    /// * if `Some(None)` then `self` will clear password
+    /// * if `Some(Some(_))` then `self` will change password
+    pub fn pass(&self) -> Option<Option<&str>> {
+        self.pass.as_ref().map(|x| x.as_deref())
+    }
+
+    /// Returns database name.
+    ///
+    /// * if `None` then `self` does not meant to change database name
+    /// * if `Some(None)` then `self` will clear database name
+    /// * if `Some(Some(_))` then `self` will change database name
+    pub fn db_name(&self) -> Option<Option<&str>> {
+        self.db_name.as_ref().map(|x| x.as_deref())
+    }
+}
+
+impl Default for ChangeUserOpts {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Debug for ChangeUserOpts {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ChangeUserOpts")
+            .field("user", &self.user)
+            .field(
+                "pass",
+                &self.pass.as_ref().map(|x| x.as_ref().map(|_| "...")),
+            )
+            .field("db_name", &self.db_name)
+            .finish()
     }
 }
 
@@ -1180,7 +1424,6 @@ fn mysqlopts_from_url(url: &Url) -> std::result::Result<MysqlOpts, UrlError> {
                 Ok(value) => {
                     opts.pool_opts = opts
                         .pool_opts
-                        .clone()
                         .with_inactive_connection_ttl(Duration::from_secs(value))
                 }
                 _ => {
@@ -1195,7 +1438,6 @@ fn mysqlopts_from_url(url: &Url) -> std::result::Result<MysqlOpts, UrlError> {
                 Ok(value) => {
                     opts.pool_opts = opts
                         .pool_opts
-                        .clone()
                         .with_ttl_check_interval(Duration::from_secs(value))
                 }
                 _ => {
@@ -1247,6 +1489,26 @@ fn mysqlopts_from_url(url: &Url) -> std::result::Result<MysqlOpts, UrlError> {
                 _ => {
                     return Err(UrlError::InvalidParamValue {
                         param: "wait_timeout".into(),
+                        value,
+                    });
+                }
+            }
+        } else if key == "enable_cleartext_plugin" {
+            match bool::from_str(&*value) {
+                Ok(parsed) => opts.enable_cleartext_plugin = parsed,
+                Err(_) => {
+                    return Err(UrlError::InvalidParamValue {
+                        param: key.to_string(),
+                        value,
+                    });
+                }
+            }
+        } else if key == "reset_connection" {
+            match bool::from_str(&*value) {
+                Ok(parsed) => opts.pool_opts = opts.pool_opts.with_reset_connection(parsed),
+                Err(_) => {
+                    return Err(UrlError::InvalidParamValue {
+                        param: key.to_string(),
                         value,
                     });
                 }
@@ -1368,7 +1630,7 @@ fn mysqlopts_from_url(url: &Url) -> std::result::Result<MysqlOpts, UrlError> {
     }
 
     if let Some(pool_constraints) = PoolConstraints::new(pool_min, pool_max) {
-        opts.pool_opts = opts.pool_opts.clone().with_constraints(pool_constraints);
+        opts.pool_opts = opts.pool_opts.with_constraints(pool_constraints);
     } else {
         return Err(UrlError::InvalidPoolConstraints {
             min: pool_min,
@@ -1425,6 +1687,7 @@ mod test {
         assert_eq!(url_opts.pass(), builder_opts.pass());
         assert_eq!(url_opts.db_name(), builder_opts.db_name());
         assert_eq!(url_opts.init(), builder_opts.init());
+        assert_eq!(url_opts.setup(), builder_opts.setup());
         assert_eq!(url_opts.tcp_keepalive(), builder_opts.tcp_keepalive());
         assert_eq!(url_opts.tcp_nodelay(), builder_opts.tcp_nodelay());
         assert_eq!(url_opts.pool_opts(), builder_opts.pool_opts());
