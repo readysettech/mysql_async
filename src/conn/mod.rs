@@ -1874,11 +1874,15 @@ mod test {
     // TODO(andrewtsakiris): In order to push these changes upstream, need to configure test DB
     // to have proper GTID-enabled configuration. This test assumes relevant system variables are
     // set properly on the server.
+    // TODO(marcelo): We should be able to upstream this changes now that we adjust the test to
+    // use session_track_gtids = `OWN_GTID` .
     #[tokio::test]
     async fn should_get_gtid_after_transaction() -> super::Result<()> {
         let mut conn =
             Conn::new(get_opts().add_capability(CapabilityFlags::CLIENT_SESSION_TRACK)).await?;
 
+        // Track GTID
+        conn.query_drop("SET @@session.session_track_gtids = OWN_GTID").await?;
         // Using Conn
         conn.query_drop("DROP TABLE IF EXISTS gtid_test").await?;
         conn.query_drop("CREATE TABLE gtid_test (id INT, name TEXT)")
