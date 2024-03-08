@@ -53,6 +53,7 @@
 //!     -   `mysql_common/time03`
 //!     -   `mysql_common/uuid`
 //!     -   `mysql_common/frunk`
+//!     -   `binlog`
 //!
 //! *   `default-rustls` – same as default but with `rustls-tls` instead of `native-tls-tls`.
 //!
@@ -94,6 +95,10 @@
 //!     ```
 //!
 //! *   `derive` – enables `mysql_commom/derive` feature
+//!
+//! *   `binlog` - enables binlog-related functionality. Enables:
+//!
+//!     -   `mysql_common/binlog"
 //!
 //! [myslqcommonfeatures]: https://github.com/blackbeam/rust_mysql_common#crate-features
 //!
@@ -451,8 +456,12 @@ thread_local! {
         once_cell::sync::Lazy::new(Default::default);
 }
 
+#[cfg(feature = "binlog")]
 #[doc(inline)]
-pub use self::conn::{binlog_stream::BinlogStream, Conn};
+pub use self::conn::binlog_stream::{request::BinlogStreamRequest, BinlogStream};
+
+#[doc(inline)]
+pub use self::conn::Conn;
 
 #[doc(inline)]
 pub use self::conn::pool::Pool;
@@ -484,14 +493,14 @@ pub use self::local_infile_handler::{builtin::WhiteListFsHandler, InfileData};
 
 #[doc(inline)]
 pub use mysql_common::packets::{
-    binlog_request::BinlogRequest,
     session_state_change::{
         Gtids, Schema, SessionStateChange, SystemVariable, TransactionCharacteristics,
         TransactionState, Unsupported,
     },
-    BinlogDumpFlags, Column, GnoInterval, OkPacket, SessionStateInfo, Sid,
+    Column, GnoInterval, OkPacket, SessionStateInfo, Sid,
 };
 
+#[cfg(feature = "binlog")]
 pub mod binlog {
     #[doc(inline)]
     pub use mysql_common::binlog::consts::*;
@@ -580,7 +589,7 @@ pub mod prelude {
     pub trait ToConnection<'a, 't: 'a>: crate::connection_like::ToConnection<'a, 't> {}
     // explicitly implemented because of rusdoc
     impl<'a> ToConnection<'a, 'static> for &'a crate::Pool {}
-    impl<'a> ToConnection<'static, 'static> for crate::Pool {}
+    impl ToConnection<'static, 'static> for crate::Pool {}
     impl ToConnection<'static, 'static> for crate::Conn {}
     impl<'a> ToConnection<'a, 'static> for &'a mut crate::Conn {}
     impl<'a, 't> ToConnection<'a, 't> for &'a mut crate::Transaction<'t> {}
@@ -605,7 +614,9 @@ pub mod test_misc {
     #[allow(unreachable_code)]
     fn error_should_implement_send_and_sync() {
         fn _dummy<T: Send + Sync + Unpin>(_: T) {}
-        _dummy(panic!());
+        #[allow(unused_variables)]
+        let err: crate::Error = panic!();
+        _dummy(err);
     }
 
     lazy_static! {
@@ -627,7 +638,7 @@ pub mod test_misc {
     }
 
     pub fn get_opts() -> OptsBuilder {
-        let mut builder = OptsBuilder::from_opts(Opts::from_url(&**DATABASE_URL).unwrap());
+        let mut builder = OptsBuilder::from_opts(Opts::from_url(&DATABASE_URL).unwrap());
         if test_ssl() {
             let ssl_opts = SslOpts::default()
                 .with_danger_skip_domain_validation(true)

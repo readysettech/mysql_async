@@ -14,9 +14,9 @@ use mysql_common::{
     crypto,
     io::ParseBuf,
     packets::{
-        binlog_request::BinlogRequest, session_state_change::SessionStateChange, AuthPlugin,
-        AuthSwitchRequest, CommonOkPacket, ErrPacket, HandshakePacket, HandshakeResponse, OkPacket,
-        OkPacketDeserializer, OldAuthSwitchRequest, OldEofPacket, ResultSetTerminator, SslRequest,
+        session_state_change::SessionStateChange, AuthPlugin, AuthSwitchRequest, CommonOkPacket, ErrPacket, HandshakePacket,
+        HandshakeResponse, OkPacket, OkPacketDeserializer, OldAuthSwitchRequest, OldEofPacket,
+        ResultSetTerminator, SslRequest,
     },
     proto::MySerialize,
     row::Row,
@@ -45,15 +45,18 @@ use crate::{
         transaction::TxStatus,
         BinaryProtocol, Queryable, TextProtocol,
     },
-    BinlogStream, ChangeUserOpts, InfileData, OptsBuilder,
+    ChangeUserOpts, InfileData, OptsBuilder,
 };
 
 use self::routines::Routine;
 
+#[cfg(feature = "binlog")]
 pub mod binlog_stream;
 pub mod pool;
 pub mod routines;
 pub mod stmt_cache;
+
+const DEFAULT_WAIT_TIMEOUT: usize = 28800;
 
 /// Helper that asynchronously disconnects the givent connection on the default tokio executor.
 fn disconnect(mut conn: Conn) {
@@ -105,6 +108,7 @@ struct ConnInner {
     tx_status: TxStatus,
     reset_upon_returning_to_a_pool: bool,
     opts: Opts,
+    ttl_deadline: Option<Instant>,
     last_io: Instant,
     wait_timeout: Duration,
     stmt_cache: StmtCache,
@@ -138,6 +142,7 @@ impl fmt::Debug for ConnInner {
 impl ConnInner {
     /// Constructs an empty connection.
     fn empty(opts: Opts) -> ConnInner {
+        let ttl_deadline = opts.pool_opts().new_connection_ttl_deadline();
         ConnInner {
             capabilities: opts.get_capabilities(),
             status: StatusFlags::empty(),
@@ -155,6 +160,7 @@ impl ConnInner {
             stmt_cache: StmtCache::new(opts.stmt_cache_size()),
             socket: opts.socket().map(Into::into),
             opts,
+            ttl_deadline,
             nonce: Vec::default(),
             auth_plugin: AuthPlugin::MysqlNativePassword,
             auth_switched: false,
@@ -321,7 +327,7 @@ impl Conn {
         if let Err(ref e) = self.inner.pending_result {
             let e = e.clone();
             self.inner.pending_result = Ok(None);
-            return Err(e);
+            Err(e)
         } else {
             Ok(self.inner.pending_result.as_ref().unwrap().as_ref())
         }
@@ -334,8 +340,7 @@ impl Conn {
     }
 
     pub(crate) fn has_pending_result(&self) -> bool {
-        matches!(self.inner.pending_result, Err(_))
-            || matches!(self.inner.pending_result, Ok(Some(_)))
+        self.inner.pending_result.is_err() || matches!(self.inner.pending_result, Ok(Some(_)))
     }
 
     /// Sets the given pening result metadata for this connection. Returns the previous value.
@@ -499,7 +504,7 @@ impl Conn {
 
     async fn handle_handshake(&mut self) -> Result<()> {
         let packet = self.read_packet().await?;
-        let handshake = ParseBuf(&*packet).parse::<HandshakePacket>(())?;
+        let handshake = ParseBuf(&packet).parse::<HandshakePacket>(())?;
 
         // Handshake scramble is always 21 bytes length (20 + zero terminator)
         self.inner.nonce = {
@@ -575,7 +580,7 @@ impl Conn {
         let auth_data = self
             .inner
             .auth_plugin
-            .gen_data(self.inner.opts.pass(), &*self.inner.nonce);
+            .gen_data(self.inner.opts.pass(), &self.inner.nonce);
 
         let handshake_response = HandshakeResponse::new(
             auth_data.as_deref(),
@@ -606,10 +611,9 @@ impl Conn {
             if matches!(
                 auth_switch_request.auth_plugin(),
                 AuthPlugin::MysqlOldPassword
-            ) {
-                if self.inner.opts.secure_auth() {
-                    return Err(DriverError::MysqlOldPasswordDisabled.into());
-                }
+            ) && self.inner.opts.secure_auth()
+            {
+                return Err(DriverError::MysqlOldPasswordDisabled.into());
             }
 
             self.inner.auth_plugin = auth_switch_request.auth_plugin().clone().into_owned();
@@ -698,7 +702,7 @@ impl Conn {
 
     async fn continue_caching_sha2_password_auth(&mut self) -> Result<()> {
         let packet = self.read_packet().await?;
-        match packet.get(0) {
+        match packet.first() {
             Some(0x00) => {
                 // ok packet for empty password
                 Ok(())
@@ -725,10 +729,10 @@ impl Conn {
                             *byte ^= self.inner.nonce[i % self.inner.nonce.len()];
                         }
                         let encrypted_pass = crypto::encrypt(
-                            &*pass,
+                            &pass,
                             self.inner.server_key.as_deref().expect("unreachable"),
                         );
-                        self.write_bytes(&*encrypted_pass).await?;
+                        self.write_bytes(&encrypted_pass).await?;
                     };
                     self.drop_packet().await?;
                     Ok(())
@@ -739,7 +743,7 @@ impl Conn {
                 .into()),
             },
             Some(0xfe) if !self.inner.auth_switched => {
-                let auth_switch_request = ParseBuf(&*packet).parse::<AuthSwitchRequest>(())?;
+                let auth_switch_request = ParseBuf(&packet).parse::<AuthSwitchRequest>(())?;
                 self.perform_auth_switch(auth_switch_request).await?;
                 Ok(())
             }
@@ -752,13 +756,13 @@ impl Conn {
 
     async fn continue_mysql_native_password_auth(&mut self) -> Result<()> {
         let packet = self.read_packet().await?;
-        match packet.get(0) {
+        match packet.first() {
             Some(0x00) => Ok(()),
             Some(0xfe) if !self.inner.auth_switched => {
                 let auth_switch = if packet.len() > 1 {
-                    ParseBuf(&*packet).parse(())?
+                    ParseBuf(&packet).parse(())?
                 } else {
-                    let _ = ParseBuf(&*packet).parse::<OldAuthSwitchRequest>(())?;
+                    let _ = ParseBuf(&packet).parse::<OldAuthSwitchRequest>(())?;
                     // map OldAuthSwitch to AuthSwitch with mysql_old_password plugin
                     AuthSwitchRequest::new(
                         "mysql_old_password".as_bytes(),
@@ -781,16 +785,16 @@ impl Conn {
                 .capabilities()
                 .contains(CapabilityFlags::CLIENT_DEPRECATE_EOF)
             {
-                ParseBuf(&*packet)
+                ParseBuf(packet)
                     .parse::<OkPacketDeserializer<ResultSetTerminator>>(self.capabilities())
                     .map(|x| x.into_inner())
             } else {
-                ParseBuf(&*packet)
+                ParseBuf(packet)
                     .parse::<OkPacketDeserializer<OldEofPacket>>(self.capabilities())
                     .map(|x| x.into_inner())
             }
         } else {
-            ParseBuf(&*packet)
+            ParseBuf(packet)
                 .parse::<OkPacketDeserializer<CommonOkPacket>>(self.capabilities())
                 .map(|x| x.into_inner())
         };
@@ -798,7 +802,7 @@ impl Conn {
         if let Ok(ok_packet) = ok_packet {
             self.handle_ok(ok_packet.into_owned());
         } else {
-            let err_packet = ParseBuf(&*packet).parse::<ErrPacket>(self.capabilities());
+            let err_packet = ParseBuf(packet).parse::<ErrPacket>(self.capabilities());
             if let Ok(err_packet) = err_packet {
                 self.handle_err(err_packet)?;
                 return Ok(true);
@@ -981,42 +985,121 @@ impl Conn {
     /// * It reads and stores `wait_timeout` in the connection unless it's already in [`Opts`]
     ///
     async fn read_settings(&mut self) -> Result<()> {
-        let read_socket = self.inner.opts.prefer_socket() && self.inner.socket.is_none();
-        let read_max_allowed_packet = self.opts().max_allowed_packet().is_none();
-        let read_wait_timeout = self.opts().wait_timeout().is_none();
+        enum Action {
+            Load(Cfg),
+            Apply(CfgData),
+        }
 
-        let settings: Option<Row> = if read_socket || read_max_allowed_packet || read_wait_timeout {
-            self.query_internal("SELECT @@socket, @@max_allowed_packet, @@wait_timeout")
+        enum CfgData {
+            MaxAllowedPacket(usize),
+            WaitTimeout(usize),
+        }
+
+        impl CfgData {
+            fn apply(&self, conn: &mut Conn) {
+                match self {
+                    Self::MaxAllowedPacket(value) => {
+                        if let Some(stream) = conn.inner.stream.as_mut() {
+                            stream.set_max_allowed_packet(*value);
+                        }
+                    }
+                    Self::WaitTimeout(value) => {
+                        conn.inner.wait_timeout = Duration::from_secs(*value as u64);
+                    }
+                }
+            }
+        }
+
+        enum Cfg {
+            Socket,
+            MaxAllowedPacket,
+            WaitTimeout,
+        }
+
+        impl Cfg {
+            const fn name(&self) -> &'static str {
+                match self {
+                    Self::Socket => "@@socket",
+                    Self::MaxAllowedPacket => "@@max_allowed_packet",
+                    Self::WaitTimeout => "@@wait_timeout",
+                }
+            }
+
+            fn apply(&self, conn: &mut Conn, value: Option<crate::Value>) {
+                match self {
+                    Cfg::Socket => {
+                        conn.inner.socket = value.and_then(crate::from_value);
+                    }
+                    Cfg::MaxAllowedPacket => {
+                        if let Some(stream) = conn.inner.stream.as_mut() {
+                            stream.set_max_allowed_packet(
+                                value
+                                    .and_then(crate::from_value)
+                                    .unwrap_or(DEFAULT_MAX_ALLOWED_PACKET),
+                            );
+                        }
+                    }
+                    Cfg::WaitTimeout => {
+                        conn.inner.wait_timeout = Duration::from_secs(
+                            value
+                                .and_then(crate::from_value)
+                                .unwrap_or(DEFAULT_WAIT_TIMEOUT) as u64,
+                        );
+                    }
+                }
+            }
+        }
+
+        let mut actions = vec![
+            if let Some(x) = self.opts().max_allowed_packet() {
+                Action::Apply(CfgData::MaxAllowedPacket(x))
+            } else {
+                Action::Load(Cfg::MaxAllowedPacket)
+            },
+            if let Some(x) = self.opts().wait_timeout() {
+                Action::Apply(CfgData::WaitTimeout(x))
+            } else {
+                Action::Load(Cfg::WaitTimeout)
+            },
+        ];
+
+        if self.inner.opts.prefer_socket() && self.inner.socket.is_none() {
+            actions.push(Action::Load(Cfg::Socket))
+        }
+
+        let loads = actions
+            .iter()
+            .filter_map(|x| match x {
+                Action::Load(x) => Some(x),
+                Action::Apply(_) => None,
+            })
+            .collect::<Vec<_>>();
+
+        let loaded = if !loads.is_empty() {
+            let query = loads
+                .iter()
+                .zip(std::iter::once(' ').chain(std::iter::repeat(',')))
+                .fold("SELECT".to_owned(), |mut acc, (cfg, prefix)| {
+                    acc.push(prefix);
+                    acc.push_str(cfg.name());
+                    acc
+                });
+
+            self.query_internal::<Row, String>(query)
                 .await?
+                .map(|row| row.unwrap())
+                .unwrap_or_else(|| vec![crate::Value::NULL; loads.len()])
         } else {
-            None
+            vec![]
         };
+        let mut loaded = loaded.into_iter();
 
-        // set socket inside the connection
-        if read_socket {
-            self.inner.socket = settings.as_ref().map(|s| s.get("@@socket")).unwrap_or(None);
+        for action in actions {
+            match action {
+                Action::Load(cfg) => cfg.apply(self, loaded.next()),
+                Action::Apply(cfg) => cfg.apply(self),
+            }
         }
-
-        // set max_allowed_packet
-        let max_allowed_packet = if read_max_allowed_packet {
-            settings
-                .as_ref()
-                .map(|s| s.get("@@max_allowed_packet"))
-                .unwrap()
-        } else {
-            self.opts().max_allowed_packet()
-        };
-        if let Some(stream) = self.inner.stream.as_mut() {
-            stream.set_max_allowed_packet(max_allowed_packet.unwrap_or(DEFAULT_MAX_ALLOWED_PACKET));
-        }
-
-        // set read_wait_timeout
-        let wait_timeout = if read_wait_timeout {
-            settings.as_ref().map(|s| s.get("@@wait_timeout")).unwrap()
-        } else {
-            self.opts().wait_timeout()
-        };
-        self.inner.wait_timeout = Duration::from_secs(wait_timeout.unwrap_or(28800) as u64);
 
         Ok(())
     }
@@ -1024,6 +1107,11 @@ impl Conn {
     /// Returns true if time since last IO exceeds `wait_timeout`
     /// (or `conn_ttl` if specified in opts).
     fn expired(&self) -> bool {
+        if let Some(deadline) = self.inner.ttl_deadline {
+            if Instant::now() > deadline {
+                return true;
+            }
+        }
         let ttl = self
             .inner
             .opts
@@ -1187,115 +1275,21 @@ impl Conn {
         }
         Ok(self)
     }
-
-    async fn register_as_slave(&mut self, server_id: u32) -> Result<()> {
-        use mysql_common::packets::ComRegisterSlave;
-
-        self.query_drop("SET @master_binlog_checksum='ALL'").await?;
-        self.write_command(&ComRegisterSlave::new(server_id))
-            .await?;
-
-        // Server will respond with OK.
-        self.read_packet().await?;
-
-        Ok(())
-    }
-
-    async fn request_binlog(&mut self, request: BinlogRequest<'_>) -> Result<()> {
-        self.register_as_slave(request.server_id()).await?;
-        self.write_command(&request.as_cmd()).await?;
-        Ok(())
-    }
-
-    pub async fn get_binlog_stream(mut self, request: BinlogRequest<'_>) -> Result<BinlogStream> {
-        self.request_binlog(request).await?;
-
-        Ok(BinlogStream::new(self))
-    }
 }
 
 #[cfg(test)]
 mod test {
     use bytes::Bytes;
     use futures_util::stream::{self, StreamExt};
-    use mysql_common::{binlog::events::EventData, constants::MAX_PAYLOAD_LEN};
+    use mysql_common::constants::MAX_PAYLOAD_LEN;
     use rand::Fill;
-    use tokio::time::timeout;
-
-    use std::time::Duration;
 
     use mysql_common::constants::CapabilityFlags;
 
     use crate::{
-        from_row, params, prelude::*, test_misc::get_opts, BinlogDumpFlags, BinlogRequest,
-        ChangeUserOpts, Conn, Error, OptsBuilder, Pool, TxOpts, Value, WhiteListFsHandler,
+        from_row, params, prelude::*, test_misc::get_opts, ChangeUserOpts, Conn, Error,
+        OptsBuilder, Pool, TxOpts, Value, WhiteListFsHandler,
     };
-
-    async fn gen_dummy_data() -> super::Result<()> {
-        let mut conn = Conn::new(get_opts()).await?;
-
-        "CREATE TABLE IF NOT EXISTS customers (customer_id int not null)"
-            .ignore(&mut conn)
-            .await?;
-
-        for i in 0_u8..100 {
-            "INSERT INTO customers(customer_id) VALUES (?)"
-                .with((i,))
-                .ignore(&mut conn)
-                .await?;
-        }
-
-        "DROP TABLE customers".ignore(&mut conn).await?;
-
-        Ok(())
-    }
-
-    async fn create_binlog_stream_conn(pool: Option<&Pool>) -> super::Result<(Conn, Vec<u8>, u64)> {
-        let mut conn = match pool {
-            None => Conn::new(get_opts()).await.unwrap(),
-            Some(pool) => pool.get_conn().await.unwrap(),
-        };
-
-        if let Ok(Some(gtid_mode)) = "SELECT @@GLOBAL.GTID_MODE"
-            .first::<String, _>(&mut conn)
-            .await
-        {
-            if !gtid_mode.starts_with("ON") {
-                panic!(
-                    "GTID_MODE is disabled \
-                        (enable using --gtid_mode=ON --enforce_gtid_consistency=ON)"
-                );
-            }
-        }
-
-        let row: crate::Row = "SHOW BINARY LOGS".first(&mut conn).await.unwrap().unwrap();
-        let filename = row.get(0).unwrap();
-        let position = row.get(1).unwrap();
-
-        gen_dummy_data().await.unwrap();
-        Ok((conn, filename, position))
-    }
-
-    #[tokio::test]
-    async fn should_read_binlog() -> super::Result<()> {
-        read_binlog_streams_and_close_their_connections(None, (12, 13, 14))
-            .await
-            .unwrap();
-
-        let pool = Pool::new(get_opts());
-        read_binlog_streams_and_close_their_connections(Some(&pool), (15, 16, 17))
-            .await
-            .unwrap();
-
-        // Disconnecting the pool verifies that closing the binlog connections
-        // left the pool in a sane state.
-        timeout(Duration::from_secs(10), pool.disconnect())
-            .await
-            .unwrap()
-            .unwrap();
-
-        Ok(())
-    }
 
     #[tokio::test]
     async fn should_return_found_rows_if_flag_is_set() -> super::Result<()> {
@@ -1349,121 +1343,10 @@ mod test {
         Ok(())
     }
 
-    async fn read_binlog_streams_and_close_their_connections(
-        pool: Option<&Pool>,
-        binlog_server_ids: (u32, u32, u32),
-    ) -> super::Result<()> {
-        // iterate using COM_BINLOG_DUMP
-        let (conn, filename, pos) = create_binlog_stream_conn(pool).await.unwrap();
-        let is_mariadb = conn.inner.is_mariadb;
-
-        let mut binlog_stream = conn
-            .get_binlog_stream(
-                BinlogRequest::new(binlog_server_ids.0)
-                    .with_filename(filename)
-                    .with_pos(pos),
-            )
-            .await
-            .unwrap();
-
-        let mut events_num = 0;
-        while let Ok(Some(event)) = timeout(Duration::from_secs(10), binlog_stream.next()).await {
-            let event = event.unwrap();
-            events_num += 1;
-
-            // assert that event type is known
-            event.header().event_type().unwrap();
-
-            // iterate over rows of an event
-            match event.read_data()?.unwrap() {
-                EventData::RowsEvent(re) => {
-                    let tme = binlog_stream.get_tme(re.table_id());
-                    for row in re.rows(tme.unwrap()) {
-                        row.unwrap();
-                    }
-                }
-                _ => (),
-            }
-        }
-        assert!(events_num > 0);
-        timeout(Duration::from_secs(10), binlog_stream.close())
-            .await
-            .unwrap()
-            .unwrap();
-
-        if !is_mariadb {
-            // iterate using COM_BINLOG_DUMP_GTID
-            let (conn, filename, pos) = create_binlog_stream_conn(pool).await.unwrap();
-
-            let mut binlog_stream = conn
-                .get_binlog_stream(
-                    BinlogRequest::new(binlog_server_ids.1)
-                        .with_use_gtid(true)
-                        .with_filename(filename)
-                        .with_pos(pos),
-                )
-                .await
-                .unwrap();
-
-            events_num = 0;
-            while let Ok(Some(event)) = timeout(Duration::from_secs(10), binlog_stream.next()).await
-            {
-                let event = event.unwrap();
-                events_num += 1;
-
-                // assert that event type is known
-                event.header().event_type().unwrap();
-
-                // iterate over rows of an event
-                match event.read_data()?.unwrap() {
-                    EventData::RowsEvent(re) => {
-                        let tme = binlog_stream.get_tme(re.table_id());
-                        for row in re.rows(tme.unwrap()) {
-                            row.unwrap();
-                        }
-                    }
-                    _ => (),
-                }
-            }
-            assert!(events_num > 0);
-            timeout(Duration::from_secs(10), binlog_stream.close())
-                .await
-                .unwrap()
-                .unwrap();
-        }
-
-        // iterate using COM_BINLOG_DUMP with BINLOG_DUMP_NON_BLOCK flag
-        let (conn, filename, pos) = create_binlog_stream_conn(pool).await.unwrap();
-
-        let mut binlog_stream = conn
-            .get_binlog_stream(
-                BinlogRequest::new(binlog_server_ids.2)
-                    .with_filename(filename)
-                    .with_pos(pos)
-                    .with_flags(BinlogDumpFlags::BINLOG_DUMP_NON_BLOCK),
-            )
-            .await
-            .unwrap();
-
-        events_num = 0;
-        while let Some(event) = binlog_stream.next().await {
-            let event = event.unwrap();
-            events_num += 1;
-            event.header().event_type().unwrap();
-            event.read_data().unwrap();
-        }
-        assert!(events_num > 0);
-        timeout(Duration::from_secs(10), binlog_stream.close())
-            .await
-            .unwrap()
-            .unwrap();
-
-        Ok(())
-    }
-
     #[test]
     fn opts_should_satisfy_send_and_sync() {
         struct A<T: Sync + Send>(T);
+        #[allow(clippy::unnecessary_operation)]
         A(get_opts());
     }
 
@@ -1807,7 +1690,7 @@ mod test {
     async fn should_perform_queries() -> super::Result<()> {
         let mut conn = Conn::new(get_opts()).await?;
         for x in (MAX_PAYLOAD_LEN - 2)..=(MAX_PAYLOAD_LEN + 2) {
-            let long_string = ::std::iter::repeat('A').take(x).collect::<String>();
+            let long_string = "A".repeat(x);
             let result: Vec<(String, u8)> = conn
                 .query(format!(r"SELECT '{}', 231", long_string))
                 .await?;
@@ -1859,15 +1742,11 @@ mod test {
 
     #[tokio::test]
     async fn should_execute_statement() -> super::Result<()> {
-        let long_string = ::std::iter::repeat('A')
-            .take(18 * 1024 * 1024)
-            .collect::<String>();
+        let long_string = "A".repeat(18 * 1024 * 1024);
         let mut conn = Conn::new(get_opts()).await?;
         let stmt = conn.prep(r"SELECT ?").await?;
         let result = conn.exec_iter(&stmt, (&long_string,)).await?;
-        let mut mapped = result
-            .map_and_drop(|row| from_row::<(String,)>(row))
-            .await?;
+        let mut mapped = result.map_and_drop(from_row::<(String,)>).await?;
         assert_eq!(mapped.len(), 1);
         assert_eq!(mapped.pop(), Some((long_string,)));
         let result = conn.exec_iter(&stmt, (42_u8,)).await?;
@@ -1890,7 +1769,7 @@ mod test {
             .exec_iter(&stmt, params! { "foo" => "quux", "bar" => "baz" })
             .await?;
         let mut mapped = result
-            .map_and_drop(|row| from_row::<(String, String, String, u8)>(row))
+            .map_and_drop(from_row::<(String, String, String, u8)>)
             .await?;
         assert_eq!(mapped.len(), 1);
         assert_eq!(
@@ -1982,7 +1861,7 @@ mod test {
         let result = conn.query_iter(q).await?;
 
         let loaded_structs = result
-            .map_and_drop(|row| crate::from_row::<(Vec<u8>, Vec<u8>, u64, Vec<u8>)>(row))
+            .map_and_drop(crate::from_row::<(Vec<u8>, Vec<u8>, u64, Vec<u8>)>)
             .await?;
 
         conn.disconnect().await?;
@@ -2009,6 +1888,7 @@ mod test {
             .await?;
         conn.query_drop("COMMIT").await?;
         let gtid = conn.session_state_changes_track_gtids();
+        
         assert!(gtid.is_some() && gtid.unwrap().contains(":")); // expecting "<server>:<txid>"
 
         // Using Transaction
