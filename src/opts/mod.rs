@@ -16,6 +16,7 @@ pub use native_tls_opts::ClientIdentity;
 pub use rustls_opts::ClientIdentity;
 
 use percent_encoding::percent_decode;
+use rand::Rng;
 use url::{Host, Url};
 
 use std::{
@@ -26,7 +27,7 @@ use std::{
     path::Path,
     str::FromStr,
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
     vec,
 };
 
@@ -209,6 +210,8 @@ pub struct PoolOpts {
     constraints: PoolConstraints,
     inactive_connection_ttl: Duration,
     ttl_check_interval: Duration,
+    abs_conn_ttl: Option<Duration>,
+    abs_conn_ttl_jitter: Option<Duration>,
     reset_connection: bool,
 }
 
@@ -249,7 +252,7 @@ impl PoolOpts {
     /// So to encrease overall performance you can safely opt-out of the default behavior
     /// if you are not willing to change the session state in an unpleasant way.
     ///
-    /// It is also possible to selectively opt-in/out using [`Conn::reset_connection`].
+    /// It is also possible to selectively opt-in/out using [`Conn::reset_connection`][1].
     ///
     /// # Connection URL
     ///
@@ -263,6 +266,8 @@ impl PoolOpts {
     /// assert_eq!(opts.pool_opts().reset_connection(), false);
     /// # Ok(()) }
     /// ```
+    ///
+    /// [1]: crate::Conn::reset_connection
     pub fn with_reset_connection(mut self, reset_connection: bool) -> Self {
         self.reset_connection = reset_connection;
         self
@@ -271,6 +276,49 @@ impl PoolOpts {
     /// Returns the `reset_connection` value (see [`PoolOpts::with_reset_connection`]).
     pub fn reset_connection(&self) -> bool {
         self.reset_connection
+    }
+
+    /// Sets an absolute TTL after which a connection is removed from the pool.
+    /// This may push the pool below the requested minimum pool size and is indepedent of the
+    /// idle TTL.
+    /// The absolute TTL is disabled by default.
+    /// Fractions of seconds are ignored.
+    pub fn with_abs_conn_ttl(mut self, ttl: Option<Duration>) -> Self {
+        self.abs_conn_ttl = ttl;
+        self
+    }
+
+    /// Optionally, the absolute TTL can be extended by a per-connection random amount
+    /// bounded by `jitter`.
+    /// Setting `abs_conn_ttl_jitter` without `abs_conn_ttl` has no effect.
+    /// Fractions of seconds are ignored.
+    pub fn with_abs_conn_ttl_jitter(mut self, jitter: Option<Duration>) -> Self {
+        self.abs_conn_ttl_jitter = jitter;
+        self
+    }
+
+    /// Returns the absolute TTL, if set.
+    pub fn abs_conn_ttl(&self) -> Option<Duration> {
+        self.abs_conn_ttl
+    }
+
+    /// Returns the absolute TTL's jitter bound, if set.
+    pub fn abs_conn_ttl_jitter(&self) -> Option<Duration> {
+        self.abs_conn_ttl_jitter
+    }
+
+    /// Returns a new deadline that's TTL (+ random jitter) in the future.
+    pub(crate) fn new_connection_ttl_deadline(&self) -> Option<Instant> {
+        if let Some(ttl) = self.abs_conn_ttl {
+            let jitter = if let Some(jitter) = self.abs_conn_ttl_jitter {
+                Duration::from_secs(rand::thread_rng().gen_range(0..=jitter.as_secs()))
+            } else {
+                Duration::ZERO
+            };
+            Some(Instant::now() + ttl + jitter)
+        } else {
+            None
+        }
     }
 
     /// Pool will recycle inactive connection if it is outside of the lower bound of the pool
@@ -359,6 +407,8 @@ impl Default for PoolOpts {
             constraints: DEFAULT_POOL_CONSTRAINTS,
             inactive_connection_ttl: DEFAULT_INACTIVE_CONNECTION_TTL,
             ttl_check_interval: DEFAULT_TTL_CHECK_INTERVAL,
+            abs_conn_ttl: None,
+            abs_conn_ttl_jitter: None,
             reset_connection: true,
         }
     }
@@ -589,7 +639,10 @@ impl Opts {
     }
 
     /// Commands to execute on new connection and every time
-    /// [`Conn::reset`] or [`Conn::change_user`] is invoked.
+    /// [`Conn::reset`][1] or [`Conn::change_user`][2] is invoked.
+    ///
+    /// [1]: crate::Conn::reset
+    /// [2]: crate::Conn::change_user
     pub fn setup(&self) -> &[String] {
         self.inner.mysql_opts.setup.as_ref()
     }
@@ -662,6 +715,49 @@ impl Opts {
     /// ```
     pub fn conn_ttl(&self) -> Option<Duration> {
         self.inner.mysql_opts.conn_ttl
+    }
+
+    /// The pool will close a connection when this absolute TTL has elapsed.
+    /// Disabled by default.
+    ///
+    /// Enables forced recycling and migration of connections in a guaranteed timeframe.
+    /// This TTL bypasses pool constraints and an idle pool can go below the min size.
+    ///
+    /// # Connection URL
+    ///
+    /// You can use `abs_conn_ttl` URL parameter to set this value (in seconds). E.g.
+    ///
+    /// ```
+    /// # use mysql_async::*;
+    /// # use std::time::Duration;
+    /// # fn main() -> Result<()> {
+    /// let opts = Opts::from_url("mysql://localhost/db?abs_conn_ttl=86400")?;
+    /// assert_eq!(opts.abs_conn_ttl(), Some(Duration::from_secs(24 * 60 * 60)));
+    /// # Ok(()) }
+    /// ```
+    pub fn abs_conn_ttl(&self) -> Option<Duration> {
+        self.inner.mysql_opts.pool_opts.abs_conn_ttl
+    }
+
+    /// Upper bound of a random value added to the absolute TTL, if enabled.
+    /// Disabled by default.
+    ///
+    /// Should be used to prevent connections from closing at the same time.
+    ///
+    /// # Connection URL
+    ///
+    /// You can use `abs_conn_ttl_jitter` URL parameter to set this value (in seconds). E.g.
+    ///
+    /// ```
+    /// # use mysql_async::*;
+    /// # use std::time::Duration;
+    /// # fn main() -> Result<()> {
+    /// let opts = Opts::from_url("mysql://localhost/db?abs_conn_ttl=7200&abs_conn_ttl_jitter=3600")?;
+    /// assert_eq!(opts.abs_conn_ttl_jitter(), Some(Duration::from_secs(60 * 60)));
+    /// # Ok(()) }
+    /// ```
+    pub fn abs_conn_ttl_jitter(&self) -> Option<Duration> {
+        self.inner.mysql_opts.pool_opts.abs_conn_ttl_jitter
     }
 
     /// Number of prepared statements cached on the client side (per connection). Defaults to
@@ -1012,7 +1108,7 @@ impl OptsBuilder {
         OptsBuilder {
             tcp_port: opts.inner.address.get_tcp_port(),
             ip_or_hostname: opts.inner.address.get_ip_or_hostname().to_string(),
-            opts: (*opts.inner).mysql_opts.clone(),
+            opts: opts.inner.mysql_opts.clone(),
         }
     }
 
@@ -1343,24 +1439,23 @@ fn get_opts_user_from_url(url: &Url) -> Option<String> {
 }
 
 fn get_opts_pass_from_url(url: &Url) -> Option<String> {
-    if let Some(pass) = url.password() {
-        Some(
-            percent_decode(pass.as_ref())
-                .decode_utf8_lossy()
-                .into_owned(),
-        )
-    } else {
-        None
-    }
+    url.password().map(|pass| {
+        percent_decode(pass.as_ref())
+            .decode_utf8_lossy()
+            .into_owned()
+    })
 }
 
 fn get_opts_db_name_from_url(url: &Url) -> Option<String> {
     if let Some(mut segments) = url.path_segments() {
-        segments.next().map(|db_name| {
-            percent_decode(db_name.as_ref())
-                .decode_utf8_lossy()
-                .into_owned()
-        })
+        segments
+            .next()
+            .map(|db_name| {
+                percent_decode(db_name.as_ref())
+                    .decode_utf8_lossy()
+                    .into_owned()
+            })
+            .filter(|db| !db.is_empty())
     } else {
         None
     }
@@ -1375,9 +1470,9 @@ fn from_url_basic(url: &Url) -> std::result::Result<(MysqlOpts, Vec<(String, Str
     if url.cannot_be_a_base() || !url.has_host() {
         return Err(UrlError::Invalid);
     }
-    let user = get_opts_user_from_url(&url);
-    let pass = get_opts_pass_from_url(&url);
-    let db_name = get_opts_db_name_from_url(&url);
+    let user = get_opts_user_from_url(url);
+    let pass = get_opts_pass_from_url(url);
+    let db_name = get_opts_db_name_from_url(url);
 
     let query_pairs = url.query_pairs().into_owned().collect();
     let opts = MysqlOpts {
@@ -1400,7 +1495,7 @@ fn mysqlopts_from_url(url: &Url) -> std::result::Result<MysqlOpts, UrlError> {
 
     for (key, value) in query_pairs {
         if key == "pool_min" {
-            match usize::from_str(&*value) {
+            match usize::from_str(&value) {
                 Ok(value) => pool_min = value,
                 _ => {
                     return Err(UrlError::InvalidParamValue {
@@ -1410,7 +1505,7 @@ fn mysqlopts_from_url(url: &Url) -> std::result::Result<MysqlOpts, UrlError> {
                 }
             }
         } else if key == "pool_max" {
-            match usize::from_str(&*value) {
+            match usize::from_str(&value) {
                 Ok(value) => pool_max = value,
                 _ => {
                     return Err(UrlError::InvalidParamValue {
@@ -1420,7 +1515,7 @@ fn mysqlopts_from_url(url: &Url) -> std::result::Result<MysqlOpts, UrlError> {
                 }
             }
         } else if key == "inactive_connection_ttl" {
-            match u64::from_str(&*value) {
+            match u64::from_str(&value) {
                 Ok(value) => {
                     opts.pool_opts = opts
                         .pool_opts
@@ -1434,7 +1529,7 @@ fn mysqlopts_from_url(url: &Url) -> std::result::Result<MysqlOpts, UrlError> {
                 }
             }
         } else if key == "ttl_check_interval" {
-            match u64::from_str(&*value) {
+            match u64::from_str(&value) {
                 Ok(value) => {
                     opts.pool_opts = opts
                         .pool_opts
@@ -1448,7 +1543,7 @@ fn mysqlopts_from_url(url: &Url) -> std::result::Result<MysqlOpts, UrlError> {
                 }
             }
         } else if key == "conn_ttl" {
-            match u64::from_str(&*value) {
+            match u64::from_str(&value) {
                 Ok(value) => opts.conn_ttl = Some(Duration::from_secs(value)),
                 _ => {
                     return Err(UrlError::InvalidParamValue {
@@ -1457,8 +1552,36 @@ fn mysqlopts_from_url(url: &Url) -> std::result::Result<MysqlOpts, UrlError> {
                     });
                 }
             }
+        } else if key == "abs_conn_ttl" {
+            match u64::from_str(&value) {
+                Ok(value) => {
+                    opts.pool_opts = opts
+                        .pool_opts
+                        .with_abs_conn_ttl(Some(Duration::from_secs(value)))
+                }
+                _ => {
+                    return Err(UrlError::InvalidParamValue {
+                        param: "abs_conn_ttl".into(),
+                        value,
+                    });
+                }
+            }
+        } else if key == "abs_conn_ttl_jitter" {
+            match u64::from_str(&value) {
+                Ok(value) => {
+                    opts.pool_opts = opts
+                        .pool_opts
+                        .with_abs_conn_ttl_jitter(Some(Duration::from_secs(value)))
+                }
+                _ => {
+                    return Err(UrlError::InvalidParamValue {
+                        param: "abs_conn_ttl_jitter".into(),
+                        value,
+                    });
+                }
+            }
         } else if key == "tcp_keepalive" {
-            match u32::from_str(&*value) {
+            match u32::from_str(&value) {
                 Ok(value) => opts.tcp_keepalive = Some(value),
                 _ => {
                     return Err(UrlError::InvalidParamValue {
@@ -1468,7 +1591,7 @@ fn mysqlopts_from_url(url: &Url) -> std::result::Result<MysqlOpts, UrlError> {
                 }
             }
         } else if key == "max_allowed_packet" {
-            match usize::from_str(&*value) {
+            match usize::from_str(&value) {
                 Ok(value) => {
                     opts.max_allowed_packet =
                         Some(std::cmp::max(1024, std::cmp::min(1073741824, value)))
@@ -1481,7 +1604,7 @@ fn mysqlopts_from_url(url: &Url) -> std::result::Result<MysqlOpts, UrlError> {
                 }
             }
         } else if key == "wait_timeout" {
-            match usize::from_str(&*value) {
+            match usize::from_str(&value) {
                 #[cfg(windows)]
                 Ok(value) => opts.wait_timeout = Some(std::cmp::min(2147483, value)),
                 #[cfg(not(windows))]
@@ -1494,7 +1617,7 @@ fn mysqlopts_from_url(url: &Url) -> std::result::Result<MysqlOpts, UrlError> {
                 }
             }
         } else if key == "enable_cleartext_plugin" {
-            match bool::from_str(&*value) {
+            match bool::from_str(&value) {
                 Ok(parsed) => opts.enable_cleartext_plugin = parsed,
                 Err(_) => {
                     return Err(UrlError::InvalidParamValue {
@@ -1504,7 +1627,7 @@ fn mysqlopts_from_url(url: &Url) -> std::result::Result<MysqlOpts, UrlError> {
                 }
             }
         } else if key == "reset_connection" {
-            match bool::from_str(&*value) {
+            match bool::from_str(&value) {
                 Ok(parsed) => opts.pool_opts = opts.pool_opts.with_reset_connection(parsed),
                 Err(_) => {
                     return Err(UrlError::InvalidParamValue {
@@ -1514,7 +1637,7 @@ fn mysqlopts_from_url(url: &Url) -> std::result::Result<MysqlOpts, UrlError> {
                 }
             }
         } else if key == "tcp_nodelay" {
-            match bool::from_str(&*value) {
+            match bool::from_str(&value) {
                 Ok(value) => opts.tcp_nodelay = value,
                 _ => {
                     return Err(UrlError::InvalidParamValue {
@@ -1524,7 +1647,7 @@ fn mysqlopts_from_url(url: &Url) -> std::result::Result<MysqlOpts, UrlError> {
                 }
             }
         } else if key == "stmt_cache_size" {
-            match usize::from_str(&*value) {
+            match usize::from_str(&value) {
                 Ok(stmt_cache_size) => {
                     opts.stmt_cache_size = stmt_cache_size;
                 }
@@ -1536,7 +1659,7 @@ fn mysqlopts_from_url(url: &Url) -> std::result::Result<MysqlOpts, UrlError> {
                 }
             }
         } else if key == "prefer_socket" {
-            match bool::from_str(&*value) {
+            match bool::from_str(&value) {
                 Ok(prefer_socket) => {
                     opts.prefer_socket = prefer_socket;
                 }
@@ -1548,7 +1671,7 @@ fn mysqlopts_from_url(url: &Url) -> std::result::Result<MysqlOpts, UrlError> {
                 }
             }
         } else if key == "secure_auth" {
-            match bool::from_str(&*value) {
+            match bool::from_str(&value) {
                 Ok(secure_auth) => {
                     opts.secure_auth = secure_auth;
                 }
@@ -1560,7 +1683,7 @@ fn mysqlopts_from_url(url: &Url) -> std::result::Result<MysqlOpts, UrlError> {
                 }
             }
         } else if key == "client_found_rows" {
-            match bool::from_str(&*value) {
+            match bool::from_str(&value) {
                 Ok(client_found_rows) => {
                     opts.client_found_rows = client_found_rows;
                 }
@@ -1591,7 +1714,7 @@ fn mysqlopts_from_url(url: &Url) -> std::result::Result<MysqlOpts, UrlError> {
                 });
             }
         } else if key == "require_ssl" {
-            match bool::from_str(&*value) {
+            match bool::from_str(&value) {
                 Ok(x) => opts.ssl_opts = x.then(SslOpts::default),
                 _ => {
                     return Err(UrlError::InvalidParamValue {
@@ -1601,7 +1724,7 @@ fn mysqlopts_from_url(url: &Url) -> std::result::Result<MysqlOpts, UrlError> {
                 }
             }
         } else if key == "verify_ca" {
-            match bool::from_str(&*value) {
+            match bool::from_str(&value) {
                 Ok(x) => {
                     accept_invalid_certs = !x;
                 }
@@ -1613,7 +1736,7 @@ fn mysqlopts_from_url(url: &Url) -> std::result::Result<MysqlOpts, UrlError> {
                 }
             }
         } else if key == "verify_identity" {
-            match bool::from_str(&*value) {
+            match bool::from_str(&value) {
                 Ok(x) => {
                     skip_domain_validation = !x;
                 }
@@ -1692,6 +1815,11 @@ mod test {
         assert_eq!(url_opts.tcp_nodelay(), builder_opts.tcp_nodelay());
         assert_eq!(url_opts.pool_opts(), builder_opts.pool_opts());
         assert_eq!(url_opts.conn_ttl(), builder_opts.conn_ttl());
+        assert_eq!(url_opts.abs_conn_ttl(), builder_opts.abs_conn_ttl());
+        assert_eq!(
+            url_opts.abs_conn_ttl_jitter(),
+            builder_opts.abs_conn_ttl_jitter()
+        );
         assert_eq!(url_opts.stmt_cache_size(), builder_opts.stmt_cache_size());
         assert_eq!(url_opts.ssl_opts(), builder_opts.ssl_opts());
         assert_eq!(url_opts.prefer_socket(), builder_opts.prefer_socket());
@@ -1828,5 +1956,19 @@ mod test {
 
         let opts = Opts::from_url("mysql://localhost/foo?compression=9").unwrap();
         assert_eq!(opts.compression(), Some(crate::Compression::new(9)));
+    }
+
+    #[test]
+    fn test_builder_eq_url_empty_db() {
+        let builder = super::OptsBuilder::default();
+        let builder_opts = Opts::from(builder);
+
+        let url: &str = "mysql://iq-controller@localhost";
+        let url_opts = super::Opts::from_str(url).unwrap();
+        assert_eq!(url_opts.db_name(), builder_opts.db_name());
+
+        let url: &str = "mysql://iq-controller@localhost/";
+        let url_opts = super::Opts::from_str(url).unwrap();
+        assert_eq!(url_opts.db_name(), builder_opts.db_name());
     }
 }
