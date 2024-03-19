@@ -55,18 +55,11 @@ impl fmt::Debug for GetConnInner {
     }
 }
 
-impl GetConnInner {
-    /// Take the value of the inner connection, resetting it to `New`.
-    pub fn take(&mut self) -> GetConnInner {
-        std::mem::replace(self, GetConnInner::New)
-    }
-}
-
 /// This future will take connection from a pool and resolve to [`Conn`].
 #[derive(Debug)]
 #[must_use = "futures do nothing unless you `.await` or poll them"]
 pub struct GetConn {
-    pub(crate) queue_id: Option<QueueId>,
+    pub(crate) queue_id: QueueId,
     pub(crate) pool: Option<Pool>,
     pub(crate) inner: GetConnInner,
     reset_upon_returning_to_a_pool: bool,
@@ -77,7 +70,7 @@ pub struct GetConn {
 impl GetConn {
     pub(crate) fn new(pool: &Pool, reset_upon_returning_to_a_pool: bool) -> GetConn {
         GetConn {
-            queue_id: None,
+            queue_id: QueueId::next(),
             pool: Some(pool.clone()),
             inner: GetConnInner::New,
             reset_upon_returning_to_a_pool,
@@ -112,10 +105,8 @@ impl Future for GetConn {
         loop {
             match self.inner {
                 GetConnInner::New => {
-                    let queued = self.queue_id.is_some();
-                    let queue_id = *self.queue_id.get_or_insert_with(QueueId::next);
-                    let next =
-                        ready!(Pin::new(self.pool_mut()).poll_new_conn(cx, queued, queue_id))?;
+                    let queue_id = self.queue_id;
+                    let next = ready!(self.pool_mut().poll_new_conn(cx, queue_id))?;
                     match next {
                         GetConnInner::Connecting(conn_fut) => {
                             self.inner = GetConnInner::Connecting(conn_fut);
@@ -187,10 +178,8 @@ impl Drop for GetConn {
         if let Some(pool) = self.pool.take() {
             // Remove the waker from the pool's waitlist in case this task was
             // woken by another waker, like from tokio::time::timeout.
-            if let Some(queue_id) = self.queue_id {
-                pool.unqueue(queue_id);
-            }
-            if let GetConnInner::Connecting(..) = self.inner.take() {
+            pool.unqueue(self.queue_id);
+            if let GetConnInner::Connecting(..) = self.inner {
                 pool.cancel_connection();
             }
         }

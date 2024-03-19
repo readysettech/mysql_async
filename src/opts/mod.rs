@@ -22,9 +22,9 @@ use url::{Host, Url};
 use std::{
     borrow::Cow,
     convert::TryFrom,
-    fmt,
+    fmt, io,
     net::{Ipv4Addr, Ipv6Addr},
-    path::Path,
+    path::{Path, PathBuf},
     str::FromStr,
     sync::Arc,
     time::{Duration, Instant},
@@ -115,6 +115,57 @@ impl HostPortOrUrl {
     }
 }
 
+/// Represents data that is either on-disk or in the buffer.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[cfg(any(feature = "native-tls", feature = "rustls-tls"))]
+pub enum PathOrBuf<'a> {
+    Path(Cow<'a, Path>),
+    Buf(Cow<'a, [u8]>),
+}
+
+#[cfg(any(feature = "native-tls", feature = "rustls-tls"))]
+impl<'a> PathOrBuf<'a> {
+    /// Will either read data from disk or return the buffered data.
+    pub async fn read(&self) -> io::Result<Cow<[u8]>> {
+        match self {
+            PathOrBuf::Path(x) => tokio::fs::read(x.as_ref()).await.map(Cow::Owned),
+            PathOrBuf::Buf(x) => Ok(Cow::Borrowed(x.as_ref())),
+        }
+    }
+
+    /// Borrows `self`.
+    pub fn borrow(&self) -> PathOrBuf<'_> {
+        match self {
+            PathOrBuf::Path(path) => PathOrBuf::Path(Cow::Borrowed(path.as_ref())),
+            PathOrBuf::Buf(data) => PathOrBuf::Buf(Cow::Borrowed(data.as_ref())),
+        }
+    }
+}
+
+impl From<PathBuf> for PathOrBuf<'static> {
+    fn from(value: PathBuf) -> Self {
+        Self::Path(Cow::Owned(value))
+    }
+}
+
+impl<'a> From<&'a Path> for PathOrBuf<'a> {
+    fn from(value: &'a Path) -> Self {
+        Self::Path(Cow::Borrowed(value))
+    }
+}
+
+impl From<Vec<u8>> for PathOrBuf<'static> {
+    fn from(value: Vec<u8>) -> Self {
+        Self::Buf(Cow::Owned(value))
+    }
+}
+
+impl<'a> From<&'a [u8]> for PathOrBuf<'a> {
+    fn from(value: &'a [u8]) -> Self {
+        Self::Buf(Cow::Borrowed(value))
+    }
+}
+
 /// Ssl Options.
 ///
 /// ```
@@ -125,7 +176,7 @@ impl HostPortOrUrl {
 /// // With native-tls
 /// # #[cfg(feature = "native-tls-tls")]
 /// let ssl_opts = SslOpts::default()
-///     .with_client_identity(Some(ClientIdentity::new(Path::new("/path"))
+///     .with_client_identity(Some(ClientIdentity::new(Path::new("/path").into())
 ///         .with_password("******")
 ///     ));
 ///
@@ -133,17 +184,18 @@ impl HostPortOrUrl {
 /// # #[cfg(feature = "rustls-tls")]
 /// let ssl_opts = SslOpts::default()
 ///     .with_client_identity(Some(ClientIdentity::new(
-///         Path::new("/path/to/chain"),
-///         Path::new("/path/to/priv_key")
+///         Path::new("/path/to/chain").into(),
+///         Path::new("/path/to/priv_key").into(),
 /// )));
 /// ```
 #[derive(Debug, Clone, Eq, PartialEq, Hash, Default)]
 pub struct SslOpts {
     #[cfg(any(feature = "native-tls", feature = "rustls-tls"))]
     client_identity: Option<ClientIdentity>,
-    root_cert_path: Option<Cow<'static, Path>>,
+    root_certs: Vec<PathOrBuf<'static>>,
     skip_domain_validation: bool,
     accept_invalid_certs: bool,
+    tls_hostname_override: Option<Cow<'static, str>>,
 }
 
 impl SslOpts {
@@ -156,11 +208,10 @@ impl SslOpts {
     /// Sets path to a `pem` or `der` certificate of the root that connector will trust.
     ///
     /// Multiple certs are allowed in .pem files.
-    pub fn with_root_cert_path<T: Into<Cow<'static, Path>>>(
-        mut self,
-        root_cert_path: Option<T>,
-    ) -> Self {
-        self.root_cert_path = root_cert_path.map(Into::into);
+    ///
+    /// All the elements in `root_certs` will be merged.
+    pub fn with_root_certs(mut self, root_certs: Vec<PathOrBuf<'static>>) -> Self {
+        self.root_certs = root_certs;
         self
     }
 
@@ -178,13 +229,25 @@ impl SslOpts {
         self
     }
 
+    /// If set, will override the hostname used to verify the server's certificate.
+    ///
+    /// This is useful when connecting to a server via a tunnel, where the server hostname is
+    /// different from the hostname used to connect to the tunnel.
+    pub fn with_danger_tls_hostname_override<T: Into<Cow<'static, str>>>(
+        mut self,
+        domain: Option<T>,
+    ) -> Self {
+        self.tls_hostname_override = domain.map(Into::into);
+        self
+    }
+
     #[cfg(any(feature = "native-tls", feature = "rustls-tls"))]
     pub fn client_identity(&self) -> Option<&ClientIdentity> {
         self.client_identity.as_ref()
     }
 
-    pub fn root_cert_path(&self) -> Option<&Path> {
-        self.root_cert_path.as_ref().map(AsRef::as_ref)
+    pub fn root_certs(&self) -> &[PathOrBuf<'static>] {
+        &self.root_certs
     }
 
     pub fn skip_domain_validation(&self) -> bool {
@@ -193,6 +256,10 @@ impl SslOpts {
 
     pub fn accept_invalid_certs(&self) -> bool {
         self.accept_invalid_certs
+    }
+
+    pub fn tls_hostname_override(&self) -> Option<&str> {
+        self.tls_hostname_override.as_deref()
     }
 }
 
