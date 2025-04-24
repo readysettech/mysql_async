@@ -12,6 +12,7 @@ use bytes::BytesMut;
 use futures_core::{ready, stream};
 use mysql_common::proto::codec::PacketCodec as PacketCodecInner;
 use pin_project::pin_project;
+#[cfg(any(unix, windows))]
 use socket2::{Socket as Socket2Socket, TcpKeepalive};
 #[cfg(unix)]
 use tokio::io::AsyncWriteExt;
@@ -31,6 +32,7 @@ use std::{
         ErrorKind::{BrokenPipe, NotConnected, Other},
     },
     mem::replace,
+    net::SocketAddr,
     ops::{Deref, DerefMut},
     pin::Pin,
     task::{Context, Poll},
@@ -73,7 +75,7 @@ impl Default for PacketCodec {
     fn default() -> Self {
         Self {
             inner: Default::default(),
-            decode_buf: crate::BUFFER_POOL.with(|p| p.get()),
+            decode_buf: crate::buffer_pool().get(),
         }
     }
 }
@@ -98,7 +100,7 @@ impl Decoder for PacketCodec {
 
     fn decode(&mut self, src: &mut BytesMut) -> std::result::Result<Option<Self::Item>, IoError> {
         if self.inner.decode(src, self.decode_buf.as_mut())? {
-            let new_buf = crate::BUFFER_POOL.with(|p| p.get());
+            let new_buf = crate::buffer_pool().get();
             Ok(Some(replace(&mut self.decode_buf, new_buf)))
         } else {
             Ok(None)
@@ -191,7 +193,7 @@ impl Endpoint {
         matches!(self, Endpoint::Secure(_))
     }
 
-    #[cfg(all(not(feature = "native-tls"), not(feature = "rustls")))]
+    #[cfg(all(not(feature = "native-tls-tls"), not(feature = "rustls")))]
     pub async fn make_secure(
         &mut self,
         _domain: String,
@@ -357,15 +359,27 @@ impl Stream {
         keepalive: Option<Duration>,
     ) -> io::Result<Stream> {
         let tcp_stream = match addr {
-            HostPortOrUrl::HostPort(host, port) => {
-                TcpStream::connect((host.as_str(), *port)).await?
-            }
+            HostPortOrUrl::HostPort {
+                host,
+                port,
+                resolved_ips,
+            } => match resolved_ips {
+                Some(ips) => {
+                    let addrs = ips
+                        .iter()
+                        .map(|ip| SocketAddr::new(*ip, *port))
+                        .collect::<Vec<_>>();
+                    TcpStream::connect(&*addrs).await?
+                }
+                None => TcpStream::connect((host.as_str(), *port)).await?,
+            },
             HostPortOrUrl::Url(url) => {
                 let addrs = url.socket_addrs(|| Some(DEFAULT_PORT))?;
                 TcpStream::connect(&*addrs).await?
             }
         };
 
+        #[cfg(any(unix, windows))]
         if let Some(duration) = keepalive {
             #[cfg(unix)]
             let socket = {
@@ -499,7 +513,7 @@ mod test {
             super::Endpoint::Plain(Some(stream)) => stream,
             #[cfg(feature = "rustls-tls")]
             super::Endpoint::Secure(tls_stream) => tls_stream.get_ref().0,
-            #[cfg(feature = "native-tls")]
+            #[cfg(feature = "native-tls-tls")]
             super::Endpoint::Secure(tls_stream) => tls_stream.get_ref().get_ref().get_ref(),
             _ => unreachable!(),
         };
