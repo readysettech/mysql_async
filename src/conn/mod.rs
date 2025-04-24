@@ -604,11 +604,7 @@ impl Conn {
         );
 
         // Serialize here to satisfy borrow checker.
-<<<<<<< HEAD
-        let mut buf = crate::BUFFER_POOL.with(|p| p.get());
-=======
         let mut buf = crate::buffer_pool().get();
->>>>>>> upstream/master
         handshake_response.serialize(buf.as_mut());
 
         self.write_packet(buf).await?;
@@ -662,12 +658,7 @@ impl Conn {
             if let Some(plugin_data) = plugin_data {
                 self.write_struct(&plugin_data.into_owned()).await?;
             } else {
-<<<<<<< HEAD
-                self.write_packet(crate::BUFFER_POOL.with(|p| p.get()))
-                    .await?;
-=======
                 self.write_packet(crate::buffer_pool().get()).await?;
->>>>>>> upstream/master
             }
 
             self.continue_auth().await?;
@@ -757,11 +748,7 @@ impl Conn {
                 }
                 Some(0x04) => {
                     let pass = self.inner.opts.pass().unwrap_or_default();
-<<<<<<< HEAD
-                    let mut pass = crate::BUFFER_POOL.with(|p| p.get_with(pass.as_bytes()));
-=======
                     let mut pass = crate::buffer_pool().get_with(pass.as_bytes());
->>>>>>> upstream/master
                     pass.as_mut().push(0);
 
                     if self.is_secure() || self.is_socket() {
@@ -910,21 +897,13 @@ impl Conn {
 
     /// Writes bytes to a server.
     pub(crate) async fn write_bytes(&mut self, bytes: &[u8]) -> Result<()> {
-<<<<<<< HEAD
-        let buf = crate::BUFFER_POOL.with(|p| p.get_with(bytes));
-=======
         let buf = crate::buffer_pool().get_with(bytes);
->>>>>>> upstream/master
         self.write_packet(buf).await
     }
 
     /// Sends a serializable structure to a server.
     pub(crate) async fn write_struct<T: MySerialize>(&mut self, x: &T) -> Result<()> {
-<<<<<<< HEAD
-        let mut buf = crate::BUFFER_POOL.with(|p| p.get());
-=======
         let mut buf = crate::buffer_pool().get();
->>>>>>> upstream/master
         x.serialize(buf.as_mut());
         self.write_packet(buf).await
     }
@@ -950,11 +929,7 @@ impl Conn {
         T: AsRef<[u8]>,
     {
         let cmd_data = cmd_data.as_ref();
-<<<<<<< HEAD
-        let mut buf = crate::BUFFER_POOL.with(|p| p.get());
-=======
         let mut buf = crate::buffer_pool().get();
->>>>>>> upstream/master
         let body = buf.as_mut();
         body.push(cmd as u8);
         body.extend_from_slice(cmd_data);
@@ -1360,11 +1335,7 @@ mod test {
 
     use crate::{
         from_row, params, prelude::*, test_misc::get_opts, ChangeUserOpts, Conn, Error,
-<<<<<<< HEAD
-        OptsBuilder, Pool, TxOpts, Value, WhiteListFsHandler,
-=======
-        OptsBuilder, Pool, ServerError, Value, WhiteListFsHandler,
->>>>>>> upstream/master
+        OptsBuilder, Pool, ServerError, TxOpts, Value, WhiteListFsHandler,
     };
 
     #[tokio::test]

@@ -454,16 +454,12 @@ mod queryable;
 
 type BoxFuture<'a, T> = futures_core::future::BoxFuture<'a, Result<T>>;
 
-<<<<<<< HEAD
 thread_local! {
-    static BUFFER_POOL: once_cell::sync::Lazy<Arc<crate::buffer_pool::BufferPool>> =
-        once_cell::sync::Lazy::new(Default::default);
-=======
-fn buffer_pool() -> &'static Arc<crate::buffer_pool::BufferPool> {
     static BUFFER_POOL: std::sync::OnceLock<Arc<crate::buffer_pool::BufferPool>> =
-        std::sync::OnceLock::new();
-    BUFFER_POOL.get_or_init(Default::default)
->>>>>>> upstream/master
+         std::sync::OnceLock::new();
+}
+fn buffer_pool() -> Arc<crate::buffer_pool::BufferPool> {
+    BUFFER_POOL.with(|pool| pool.get_or_init(Default::default).clone())
 }
 
 #[cfg(feature = "binlog")]
