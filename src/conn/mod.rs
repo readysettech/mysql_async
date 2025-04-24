@@ -102,6 +102,7 @@ struct ConnInner {
     status: StatusFlags,
     last_ok_packet: Option<OkPacket<'static>>,
     last_err_packet: Option<mysql_common::packets::ServerError<'static>>,
+    handshake_complete: bool,
     pool: Option<Pool>,
     pending_result: std::result::Result<Option<PendingResult>, ServerError>,
     tx_status: TxStatus,
@@ -115,6 +116,7 @@ struct ConnInner {
     auth_plugin: AuthPlugin<'static>,
     auth_switched: bool,
     server_key: Option<Vec<u8>>,
+    active_since: Instant,
     /// Connection is already disconnected.
     pub(crate) disconnected: bool,
     /// One-time connection-level infile handler.
@@ -147,6 +149,7 @@ impl ConnInner {
             status: StatusFlags::empty(),
             last_ok_packet: None,
             last_err_packet: None,
+            handshake_complete: false,
             stream: None,
             is_mariadb: false,
             version: (0, 0, 0),
@@ -167,6 +170,7 @@ impl ConnInner {
             server_key: None,
             infile_handler: None,
             reset_upon_returning_to_a_pool: false,
+            active_since: Instant::now(),
         }
     }
 
@@ -518,10 +522,7 @@ impl Conn {
         self.inner.capabilities = handshake.capabilities() & self.inner.opts.get_capabilities();
         self.inner.version = handshake
             .maria_db_server_version_parsed()
-            .map(|version| {
-                self.inner.is_mariadb = true;
-                version
-            })
+            .inspect(|_| self.inner.is_mariadb = true)
             .or_else(|| handshake.server_version_parsed())
             .unwrap_or((0, 0, 0));
         self.inner.id = handshake.connection_id();
@@ -566,12 +567,16 @@ impl Conn {
             );
             self.write_struct(&ssl_request).await?;
             let conn = self;
-            let ssl_opts = conn.opts().ssl_opts().cloned().expect("unreachable");
+            let ssl_opts = conn.opts().ssl_opts_and_connector().expect("unreachable");
             let domain = ssl_opts
+                .ssl_opts()
                 .tls_hostname_override()
                 .unwrap_or_else(|| conn.opts().ip_or_hostname())
                 .into();
-            conn.stream_mut()?.make_secure(domain, ssl_opts).await?;
+            let tls_connector = ssl_opts.build_tls_connector().await?;
+            conn.stream_mut()?
+                .make_secure(domain, &tls_connector)
+                .await?;
             Ok(())
         } else {
             Ok(())
@@ -599,10 +604,15 @@ impl Conn {
         );
 
         // Serialize here to satisfy borrow checker.
+<<<<<<< HEAD
         let mut buf = crate::BUFFER_POOL.with(|p| p.get());
+=======
+        let mut buf = crate::buffer_pool().get();
+>>>>>>> upstream/master
         handshake_response.serialize(buf.as_mut());
 
         self.write_packet(buf).await?;
+        self.inner.handshake_complete = true;
         Ok(())
     }
 
@@ -645,14 +655,19 @@ impl Conn {
                         return Err(DriverError::CleartextPluginDisabled.into());
                     }
                 }
+                x @ AuthPlugin::Ed25519 => x.gen_data(self.inner.opts.pass(), &self.inner.nonce),
                 x @ AuthPlugin::Other(_) => x.gen_data(self.inner.opts.pass(), &self.inner.nonce),
             };
 
             if let Some(plugin_data) = plugin_data {
                 self.write_struct(&plugin_data.into_owned()).await?;
             } else {
+<<<<<<< HEAD
                 self.write_packet(crate::BUFFER_POOL.with(|p| p.get()))
                     .await?;
+=======
+                self.write_packet(crate::buffer_pool().get()).await?;
+>>>>>>> upstream/master
             }
 
             self.continue_auth().await?;
@@ -684,6 +699,10 @@ impl Conn {
                         Err(DriverError::CleartextPluginDisabled.into())
                     }
                 }
+                AuthPlugin::Ed25519 => {
+                    self.continue_ed25519_auth().await?;
+                    Ok(())
+                }
                 AuthPlugin::Other(ref name) => Err(DriverError::UnknownAuthPlugin {
                     name: String::from_utf8_lossy(name.as_ref()).to_string(),
                 }
@@ -706,6 +725,24 @@ impl Conn {
         Ok(())
     }
 
+    async fn continue_ed25519_auth(&mut self) -> Result<()> {
+        let packet = self.read_packet().await?;
+        match packet.first() {
+            Some(0x00) => {
+                // ok packet for empty password
+                Ok(())
+            }
+            Some(0xfe) if !self.inner.auth_switched => {
+                let auth_switch_request = ParseBuf(&packet).parse::<AuthSwitchRequest>(())?;
+                self.perform_auth_switch(auth_switch_request).await
+            }
+            _ => Err(DriverError::UnexpectedPacket {
+                payload: packet.to_vec(),
+            }
+            .into()),
+        }
+    }
+
     async fn continue_caching_sha2_password_auth(&mut self) -> Result<()> {
         let packet = self.read_packet().await?;
         match packet.first() {
@@ -720,7 +757,11 @@ impl Conn {
                 }
                 Some(0x04) => {
                     let pass = self.inner.opts.pass().unwrap_or_default();
+<<<<<<< HEAD
                     let mut pass = crate::BUFFER_POOL.with(|p| p.get_with(pass.as_bytes()));
+=======
+                    let mut pass = crate::buffer_pool().get_with(pass.as_bytes());
+>>>>>>> upstream/master
                     pass.as_mut().push(0);
 
                     if self.is_secure() || self.is_socket() {
@@ -808,7 +849,19 @@ impl Conn {
         if let Ok(ok_packet) = ok_packet {
             self.handle_ok(ok_packet.into_owned());
         } else {
-            let err_packet = ParseBuf(packet).parse::<ErrPacket>(self.capabilities());
+            // If we haven't completed the handshake the server will not be aware of our
+            // capabilities and so it will behave as if we have none. In particular, the error
+            // packet will not contain a SQL State field even if our capabilities do contain the
+            // `CLIENT_PROTOCOL_41` flag. Therefore it is necessary to parse an incoming packet
+            // with no capability assumptions if we have not completed the handshake.
+            //
+            // https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_connection_phase.html
+            let capabilities = if self.inner.handshake_complete {
+                self.capabilities()
+            } else {
+                CapabilityFlags::empty()
+            };
+            let err_packet = ParseBuf(packet).parse::<ErrPacket>(capabilities);
             if let Ok(err_packet) = err_packet {
                 self.handle_err(err_packet)?;
                 return Ok(true);
@@ -857,13 +910,21 @@ impl Conn {
 
     /// Writes bytes to a server.
     pub(crate) async fn write_bytes(&mut self, bytes: &[u8]) -> Result<()> {
+<<<<<<< HEAD
         let buf = crate::BUFFER_POOL.with(|p| p.get_with(bytes));
+=======
+        let buf = crate::buffer_pool().get_with(bytes);
+>>>>>>> upstream/master
         self.write_packet(buf).await
     }
 
     /// Sends a serializable structure to a server.
     pub(crate) async fn write_struct<T: MySerialize>(&mut self, x: &T) -> Result<()> {
+<<<<<<< HEAD
         let mut buf = crate::BUFFER_POOL.with(|p| p.get());
+=======
+        let mut buf = crate::buffer_pool().get();
+>>>>>>> upstream/master
         x.serialize(buf.as_mut());
         self.write_packet(buf).await
     }
@@ -889,7 +950,11 @@ impl Conn {
         T: AsRef<[u8]>,
     {
         let cmd_data = cmd_data.as_ref();
+<<<<<<< HEAD
         let mut buf = crate::BUFFER_POOL.with(|p| p.get());
+=======
+        let mut buf = crate::buffer_pool().get();
+>>>>>>> upstream/master
         let body = buf.as_mut();
         body.push(cmd as u8);
         body.extend_from_slice(cmd_data);
@@ -932,7 +997,7 @@ impl Conn {
                 {
                     Stream::connect_socket(_path.to_owned()).await?
                 }
-                #[cfg(target_os = "windows")]
+                #[cfg(not(unix))]
                 return Err(crate::DriverError::NamedPipesDisabled.into());
             } else {
                 let keepalive = opts
@@ -984,7 +1049,7 @@ impl Conn {
     /// Configures the connection based on server settings. In particular:
     ///
     /// * It reads and stores socket address inside the connection unless if socket address is
-    /// already in [`Opts`] or if `prefer_socket` is `false`.
+    ///   already in [`Opts`] or if `prefer_socket` is `false`.
     ///
     /// * It reads and stores `max_allowed_packet` in the connection unless it's already in [`Opts`]
     ///
@@ -1206,7 +1271,7 @@ impl Conn {
     }
 
     /// Requires that `self.inner.tx_status != TxStatus::None`
-    async fn rollback_transaction(&mut self) -> Result<()> {
+    pub(crate) async fn rollback_transaction(&mut self) -> Result<()> {
         debug_assert_ne!(self.inner.tx_status, TxStatus::None);
         self.inner.tx_status = TxStatus::None;
         self.query_drop("ROLLBACK").await
@@ -1288,13 +1353,18 @@ mod test {
     use bytes::Bytes;
     use futures_util::stream::{self, StreamExt};
     use mysql_common::constants::MAX_PAYLOAD_LEN;
-    use rand::Fill;
+    use rand::Rng;
+    use tokio::{io::AsyncWriteExt, net::TcpListener};
 
     use mysql_common::constants::CapabilityFlags;
 
     use crate::{
         from_row, params, prelude::*, test_misc::get_opts, ChangeUserOpts, Conn, Error,
+<<<<<<< HEAD
         OptsBuilder, Pool, TxOpts, Value, WhiteListFsHandler,
+=======
+        OptsBuilder, Pool, ServerError, Value, WhiteListFsHandler,
+>>>>>>> upstream/master
     };
 
     #[tokio::test]
@@ -1421,16 +1491,18 @@ mod test {
         .filter(|variant| plugins.iter().any(|p| p == variant.0));
 
         for (plug, val, pass) in variants {
+            dbg!((plug, val, pass, conn.inner.version));
+
+            if plug == "mysql_native_password" && conn.inner.version >= (8, 4, 0) {
+                continue;
+            }
+
             let _ = conn.query_drop("DROP USER 'test_user'@'%'").await;
 
             let query = format!("CREATE USER 'test_user'@'%' IDENTIFIED WITH {}", plug);
             conn.query_drop(query).await.unwrap();
 
-            if (8, 0, 11) <= conn.inner.version && conn.inner.version <= (9, 0, 0) {
-                conn.query_drop(format!("SET PASSWORD FOR 'test_user'@'%' = '{}'", pass))
-                    .await
-                    .unwrap();
-            } else {
+            if conn.inner.version < (8, 0, 11) {
                 conn.query_drop(format!("SET old_passwords = {}", val))
                     .await
                     .unwrap();
@@ -1440,6 +1512,10 @@ mod test {
                 ))
                 .await
                 .unwrap();
+            } else {
+                conn.query_drop(format!("SET PASSWORD FOR 'test_user'@'%' = '{}'", pass))
+                    .await
+                    .unwrap();
             };
 
             let opts = get_opts()
@@ -1543,7 +1619,91 @@ mod test {
 
     #[tokio::test]
     async fn should_change_user() -> super::Result<()> {
+        /// Whether particular authentication plugin should be tested on the current database.
+        type ShouldRunFn = fn(bool, (u16, u16, u16)) -> bool;
+        /// Generates `CREATE USER` and `SET PASSWORD` statements
+        type CreateUserFn = fn(bool, (u16, u16, u16), &str) -> Vec<String>;
+
+        #[allow(clippy::type_complexity)]
+        const TEST_MATRIX: [(&str, ShouldRunFn, CreateUserFn); 4] = [
+            (
+                "mysql_old_password",
+                |is_mariadb, version| is_mariadb || version < (5, 7, 0),
+                |is_mariadb, version, pass| {
+                    if is_mariadb {
+                        vec![
+                            "CREATE USER '__mats'@'%' IDENTIFIED WITH mysql_old_password".into(),
+                            "SET old_passwords=1".into(),
+                            format!("ALTER USER '__mats'@'%' IDENTIFIED BY '{pass}'"),
+                            "SET old_passwords=0".into(),
+                        ]
+                    } else if matches!(version, (5, 6, _)) {
+                        vec![
+                            "CREATE USER '__mats'@'%' IDENTIFIED WITH mysql_old_password".into(),
+                            format!("SET PASSWORD FOR '__mats'@'%' = OLD_PASSWORD('{pass}')"),
+                        ]
+                    } else {
+                        vec![
+                            "CREATE USER '__mats'@'%'".into(),
+                            format!("SET PASSWORD FOR '__mats'@'%' = PASSWORD('{pass}')"),
+                        ]
+                    }
+                },
+            ),
+            (
+                "mysql_native_password",
+                |is_mariadb, version| is_mariadb || version < (8, 4, 0),
+                |is_mariadb, version, pass| {
+                    if is_mariadb {
+                        vec![
+                            format!("CREATE USER '__mats'@'%' IDENTIFIED WITH mysql_native_password AS PASSWORD('{pass}')")
+                        ]
+                    } else if version < (8, 0, 0) {
+                        vec![
+                            format!(
+                                "CREATE USER '__mats'@'%' IDENTIFIED WITH mysql_native_password"
+                            ),
+                            format!("SET old_passwords = 0"),
+                            format!("SET PASSWORD FOR '__mats'@'%' = PASSWORD('{pass}')"),
+                        ]
+                    } else {
+                        vec![
+                            format!("CREATE USER '__mats'@'%' IDENTIFIED WITH mysql_native_password BY '{pass}'")
+                        ]
+                    }
+                },
+            ),
+            (
+                "caching_sha2_password",
+                |is_mariadb, version| !is_mariadb && version >= (5, 8, 0),
+                |_is_mariadb, _version, pass| {
+                    vec![
+                        format!("CREATE USER '__mats'@'%' IDENTIFIED WITH caching_sha2_password BY '{pass}'")
+                    ]
+                },
+            ),
+            (
+                "client_ed25519",
+                |is_mariadb, version| is_mariadb && version >= (11, 6, 2),
+                |_is_mariadb, _version, pass| {
+                    vec![format!(
+                        "CREATE USER '__mats'@'%' IDENTIFIED WITH ed25519 AS PASSWORD('{pass}')"
+                    )]
+                },
+            ),
+        ];
+
+        fn random_pass() -> String {
+            let mut rng = rand::rng();
+            let pass: [u8; 10] = rng.gen();
+
+            IntoIterator::into_iter(pass)
+                .map(|x| ((x % (123 - 97)) + 97) as char)
+                .collect()
+        }
+
         let mut conn = Conn::new(get_opts()).await?;
+
         assert_eq!(
             conn.query_first::<Value, _>("SELECT @foo").await?.unwrap(),
             Value::NULL
@@ -1562,82 +1722,52 @@ mod test {
             Value::NULL
         );
 
-        let plugins: &[&str] = if !conn.inner.is_mariadb && conn.server_version() >= (5, 8, 0) {
-            &["mysql_native_password", "caching_sha2_password"]
-        } else {
-            &["mysql_native_password"]
-        };
+        for (i, (plugin, should_run, create_statements)) in TEST_MATRIX.iter().enumerate() {
+            dbg!(plugin);
+            let is_mariadb = conn.inner.is_mariadb;
+            let version = conn.server_version();
 
-        for (i, plugin) in plugins.iter().enumerate() {
-            let mut rng = rand::thread_rng();
-            let mut pass = [0u8; 10];
-            pass.try_fill(&mut rng).unwrap();
-            let pass: String = IntoIterator::into_iter(pass)
-                .map(|x| ((x % (123 - 97)) + 97) as char)
-                .collect();
+            if should_run(is_mariadb, version) {
+                let pass = random_pass();
 
-            let result = conn
-                .query_drop("DROP USER /*!50700 IF EXISTS */ /*M!100103 IF EXISTS */ __mats")
-                .await;
-            if matches!(conn.server_version(), (5, 6, _)) && i == 0 {
-                // IF EXISTS is not supported on 5.6 so the query will fail on the first iteration
-                drop(result);
-            } else {
-                result.unwrap();
-            }
+                let result = conn
+                    .query_drop("DROP USER /*!50700 IF EXISTS */ /*M!100103 IF EXISTS */ __mats")
+                    .await;
 
-            if conn.inner.is_mariadb || conn.server_version() < (5, 7, 0) {
-                if matches!(conn.server_version(), (5, 6, _)) {
-                    conn.query_drop("CREATE USER '__mats'@'%' IDENTIFIED WITH mysql_old_password")
-                        .await
-                        .unwrap();
-                    conn.query_drop(format!(
-                        "SET PASSWORD FOR '__mats'@'%' = OLD_PASSWORD({})",
-                        Value::from(pass.clone()).as_sql(false)
-                    ))
-                    .await
-                    .unwrap();
+                if matches!(version, (5, 6, _)) && i == 0 {
+                    // IF EXISTS is not supported on 5.6 so the query will fail on the first iteration
+                    drop(result);
                 } else {
-                    conn.query_drop("CREATE USER '__mats'@'%'").await.unwrap();
-                    conn.query_drop(format!(
-                        "SET PASSWORD FOR '__mats'@'%' = PASSWORD({})",
-                        Value::from(pass.clone()).as_sql(false)
-                    ))
+                    result.unwrap();
+                }
+
+                for statement in create_statements(is_mariadb, version, &pass) {
+                    conn.query_drop(dbg!(statement)).await.unwrap();
+                }
+
+                let mut conn2 = Conn::new(get_opts().secure_auth(false)).await.unwrap();
+                conn2
+                    .change_user(
+                        ChangeUserOpts::default()
+                            .with_db_name(None)
+                            .with_user(Some("__mats".into()))
+                            .with_pass(Some(pass)),
+                    )
                     .await
                     .unwrap();
-                }
-            } else {
-                conn.query_drop(format!(
-                    "CREATE USER '__mats'@'%' IDENTIFIED WITH {} BY {}",
-                    plugin,
-                    Value::from(pass.clone()).as_sql(false)
-                ))
-                .await
-                .unwrap();
-            };
 
-            let mut conn2 = Conn::new(get_opts().secure_auth(false)).await.unwrap();
-            conn2
-                .change_user(
-                    ChangeUserOpts::default()
-                        .with_db_name(None)
-                        .with_user(Some("__mats".into()))
-                        .with_pass(Some(pass)),
-                )
-                .await
-                .unwrap();
-            let (db, user) = conn2
-                .query_first::<(Option<String>, String), _>("SELECT DATABASE(), USER();")
-                .await
-                .unwrap()
-                .unwrap();
-            assert_eq!(db, None);
-            assert!(user.starts_with("__mats"));
+                let (db, user) = conn2
+                    .query_first::<(Option<String>, String), _>("SELECT DATABASE(), USER();")
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(db, None);
+                assert!(user.starts_with("__mats"));
 
-            conn2.disconnect().await.unwrap();
+                conn2.disconnect().await.unwrap();
+            }
         }
 
-        conn.disconnect().await?;
         Ok(())
     }
 
@@ -2245,6 +2375,45 @@ mod test {
         assert_eq!(result[2], "CCCCCC");
 
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn should_handle_initial_error_packet() {
+        let header = [
+            0x68, 0x00, 0x00, // packet_length
+            0x00, // sequence
+            0xff, // error_header
+            0x69, 0x04, // error_code
+        ];
+        let error_message = "Host '172.17.0.1' is blocked because of many connection errors; unblock with 'mysqladmin flush-hosts'";
+
+        // Create a fake MySQL server that immediately replies with an error packet.
+        let listener = TcpListener::bind("127.0.0.1:0000").await.unwrap();
+
+        let listen_addr = listener.local_addr().unwrap();
+
+        tokio::task::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream.write_all(&header).await.unwrap();
+            stream.write_all(error_message.as_bytes()).await.unwrap();
+            stream.shutdown().await.unwrap();
+        });
+
+        let opts = OptsBuilder::default()
+            .ip_or_hostname(listen_addr.ip().to_string())
+            .tcp_port(listen_addr.port());
+        let server_err = match Conn::new(opts).await {
+            Err(Error::Server(server_err)) => server_err,
+            other => panic!("expected server error but got: {:?}", other),
+        };
+        assert_eq!(
+            server_err,
+            ServerError {
+                code: 1129,
+                state: "HY000".to_owned(),
+                message: error_message.to_owned(),
+            }
+        );
     }
 
     #[cfg(feature = "nightly")]

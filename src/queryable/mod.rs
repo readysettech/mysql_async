@@ -96,8 +96,7 @@ impl Conn {
     pub(crate) async fn clean_dirty(&mut self) -> Result<()> {
         self.drop_result().await?;
         if self.get_tx_status() == TxStatus::RequiresRollback {
-            self.set_tx_status(TxStatus::None);
-            self.exec_drop("ROLLBACK", ()).await?;
+            self.rollback_transaction().await?;
         }
         Ok(())
     }
@@ -587,7 +586,6 @@ impl Queryable for Transaction<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::Queryable;
     use crate::{error::Result, prelude::*, test_misc::get_opts, Conn};
 
     #[tokio::test]
