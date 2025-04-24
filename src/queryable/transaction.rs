@@ -210,7 +210,7 @@ impl<'a> Transaction<'a> {
     pub async fn commit_returning_gtid(mut self) -> Result<String> {
         let result = self.0.query_iter("COMMIT").await?;
         result.drop_result().await?;
-        self.0.set_tx_status(TxStatus::None);
+        self.0.as_mut().set_tx_status(TxStatus::None);
         let gtid = self.0.session_state_changes_track_gtids();
         gtid.ok_or(Error::Other("GTID not found".into()))
     }
