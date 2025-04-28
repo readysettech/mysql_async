@@ -9,7 +9,7 @@
 mod native_tls_opts;
 mod rustls_opts;
 
-#[cfg(feature = "native-tls")]
+#[cfg(feature = "native-tls-tls")]
 pub use native_tls_opts::ClientIdentity;
 
 #[cfg(feature = "rustls-tls")]
@@ -17,13 +17,13 @@ pub use rustls_opts::ClientIdentity;
 
 use percent_encoding::percent_decode;
 use rand::Rng;
+use tokio::sync::OnceCell;
 use url::{Host, Url};
 
 use std::{
     borrow::Cow,
-    convert::TryFrom,
     fmt, io,
-    net::{Ipv4Addr, Ipv6Addr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
     path::{Path, PathBuf},
     str::FromStr,
     sync::Arc,
@@ -43,7 +43,8 @@ pub const DEFAULT_POOL_CONSTRAINTS: PoolConstraints = PoolConstraints { min: 10,
 //
 const_assert!(
     _DEFAULT_POOL_CONSTRAINTS_ARE_CORRECT,
-    DEFAULT_POOL_CONSTRAINTS.min <= DEFAULT_POOL_CONSTRAINTS.max,
+    DEFAULT_POOL_CONSTRAINTS.min <= DEFAULT_POOL_CONSTRAINTS.max
+        && 0 < DEFAULT_POOL_CONSTRAINTS.max,
 );
 
 /// Each connection will cache up to this number of statements by default.
@@ -67,37 +68,61 @@ pub const DEFAULT_TTL_CHECK_INTERVAL: Duration = Duration::from_secs(30);
 /// into socket addresses using to_socket_addrs.
 #[derive(Clone, Eq, PartialEq, Debug)]
 pub(crate) enum HostPortOrUrl {
-    HostPort(String, u16),
+    HostPort {
+        host: String,
+        port: u16,
+        /// The resolved IP addresses to use for the TCP connection. If empty,
+        /// DNS resolution of `host` will be performed.
+        resolved_ips: Option<Vec<IpAddr>>,
+    },
     Url(Url),
 }
 
 impl Default for HostPortOrUrl {
     fn default() -> Self {
-        HostPortOrUrl::HostPort("127.0.0.1".to_string(), DEFAULT_PORT)
+        HostPortOrUrl::HostPort {
+            host: "127.0.0.1".to_string(),
+            port: DEFAULT_PORT,
+            resolved_ips: None,
+        }
     }
 }
 
 impl HostPortOrUrl {
     pub fn get_ip_or_hostname(&self) -> &str {
         match self {
-            Self::HostPort(host, _) => host,
+            Self::HostPort { host, .. } => host,
             Self::Url(url) => url.host_str().unwrap_or("127.0.0.1"),
         }
     }
 
     pub fn get_tcp_port(&self) -> u16 {
         match self {
-            Self::HostPort(_, port) => *port,
+            Self::HostPort { port, .. } => *port,
             Self::Url(url) => url.port().unwrap_or(DEFAULT_PORT),
+        }
+    }
+
+    pub fn get_resolved_ips(&self) -> &Option<Vec<IpAddr>> {
+        match self {
+            Self::HostPort { resolved_ips, .. } => resolved_ips,
+            Self::Url(_) => &None,
         }
     }
 
     pub fn is_loopback(&self) -> bool {
         match self {
-            Self::HostPort(host, _) => {
+            Self::HostPort {
+                host, resolved_ips, ..
+            } => {
                 let v4addr: Option<Ipv4Addr> = FromStr::from_str(host).ok();
                 let v6addr: Option<Ipv6Addr> = FromStr::from_str(host).ok();
-                if let Some(addr) = v4addr {
+                if resolved_ips
+                    .as_ref()
+                    .is_some_and(|s| s.iter().any(|ip| ip.is_loopback()))
+                {
+                    true
+                } else if let Some(addr) = v4addr {
                     addr.is_loopback()
                 } else if let Some(addr) = v6addr {
                     addr.is_loopback()
@@ -117,13 +142,11 @@ impl HostPortOrUrl {
 
 /// Represents data that is either on-disk or in the buffer.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[cfg(any(feature = "native-tls", feature = "rustls-tls"))]
 pub enum PathOrBuf<'a> {
     Path(Cow<'a, Path>),
     Buf(Cow<'a, [u8]>),
 }
 
-#[cfg(any(feature = "native-tls", feature = "rustls-tls"))]
 impl<'a> PathOrBuf<'a> {
     /// Will either read data from disk or return the buffered data.
     pub async fn read(&self) -> io::Result<Cow<[u8]>> {
@@ -190,16 +213,17 @@ impl<'a> From<&'a [u8]> for PathOrBuf<'a> {
 /// ```
 #[derive(Debug, Clone, Eq, PartialEq, Hash, Default)]
 pub struct SslOpts {
-    #[cfg(any(feature = "native-tls", feature = "rustls-tls"))]
+    #[cfg(any(feature = "native-tls-tls", feature = "rustls-tls"))]
     client_identity: Option<ClientIdentity>,
     root_certs: Vec<PathOrBuf<'static>>,
+    disable_built_in_roots: bool,
     skip_domain_validation: bool,
     accept_invalid_certs: bool,
     tls_hostname_override: Option<Cow<'static, str>>,
 }
 
 impl SslOpts {
-    #[cfg(any(feature = "native-tls", feature = "rustls-tls"))]
+    #[cfg(any(feature = "native-tls-tls", feature = "rustls-tls"))]
     pub fn with_client_identity(mut self, identity: Option<ClientIdentity>) -> Self {
         self.client_identity = identity;
         self
@@ -215,15 +239,61 @@ impl SslOpts {
         self
     }
 
-    /// The way to not validate the server's domain
-    /// name against its certificate (defaults to `false`).
+    /// If `true`, use only the root certificates configured via [`SslOpts::with_root_certs`],
+    /// not any system or built-in certs. By default system built-in certs _will be_ used.
+    ///
+    /// # Connection URL
+    ///
+    /// Use `built_in_roots` URL parameter to set this value:
+    ///
+    /// ```
+    /// # use mysql_async::*;
+    /// # use std::time::Duration;
+    /// # fn main() -> Result<()> {
+    /// let opts = Opts::from_url("mysql://localhost/db?require_ssl=true&built_in_roots=false")?;
+    /// assert_eq!(opts.ssl_opts().unwrap().disable_built_in_roots(), true);
+    /// # Ok(()) }
+    /// ```
+    pub fn with_disable_built_in_roots(mut self, disable_built_in_roots: bool) -> Self {
+        self.disable_built_in_roots = disable_built_in_roots;
+        self
+    }
+
+    /// The way to not validate the server's domain name against its certificate.
+    /// By default domain name _will be_ validated.
+    ///
+    /// # Connection URL
+    ///
+    /// Use `verify_identity` URL parameter to set this value:
+    ///
+    /// ```
+    /// # use mysql_async::*;
+    /// # use std::time::Duration;
+    /// # fn main() -> Result<()> {
+    /// let opts = Opts::from_url("mysql://localhost/db?require_ssl=true&verify_identity=false")?;
+    /// assert_eq!(opts.ssl_opts().unwrap().skip_domain_validation(), true);
+    /// # Ok(()) }
+    /// ```
     pub fn with_danger_skip_domain_validation(mut self, value: bool) -> Self {
         self.skip_domain_validation = value;
         self
     }
 
-    /// If `true` then client will accept invalid certificate (expired, not trusted, ..)
-    /// (defaults to `false`).
+    /// If `true` then client will accept invalid certificate (expired, not trusted, ..).
+    /// Invalid certificates _won't get_ accepted by default.
+    ///
+    /// # Connection URL
+    ///
+    /// Use `verify_ca` URL parameter to set this value:
+    ///
+    /// ```
+    /// # use mysql_async::*;
+    /// # use std::time::Duration;
+    /// # fn main() -> Result<()> {
+    /// let opts = Opts::from_url("mysql://localhost/db?require_ssl=true&verify_ca=false")?;
+    /// assert_eq!(opts.ssl_opts().unwrap().accept_invalid_certs(), true);
+    /// # Ok(()) }
+    /// ```
     pub fn with_danger_accept_invalid_certs(mut self, value: bool) -> Self {
         self.accept_invalid_certs = value;
         self
@@ -241,13 +311,17 @@ impl SslOpts {
         self
     }
 
-    #[cfg(any(feature = "native-tls", feature = "rustls-tls"))]
+    #[cfg(any(feature = "native-tls-tls", feature = "rustls-tls"))]
     pub fn client_identity(&self) -> Option<&ClientIdentity> {
         self.client_identity.as_ref()
     }
 
     pub fn root_certs(&self) -> &[PathOrBuf<'static>] {
         &self.root_certs
+    }
+
+    pub fn disable_built_in_roots(&self) -> bool {
+        self.disable_built_in_roots
     }
 
     pub fn skip_domain_validation(&self) -> bool {
@@ -378,7 +452,7 @@ impl PoolOpts {
     pub(crate) fn new_connection_ttl_deadline(&self) -> Option<Instant> {
         if let Some(ttl) = self.abs_conn_ttl {
             let jitter = if let Some(jitter) = self.abs_conn_ttl_jitter {
-                Duration::from_secs(rand::thread_rng().gen_range(0..=jitter.as_secs()))
+                Duration::from_secs(rand::rng().random_range(0..=jitter.as_secs()))
             } else {
                 Duration::ZERO
             };
@@ -531,7 +605,7 @@ pub(crate) struct MysqlOpts {
     stmt_cache_size: usize,
 
     /// Driver will require SSL connection if this option isn't `None` (default to `None`).
-    ssl_opts: Option<SslOpts>,
+    ssl_opts: Option<SslOptsAndCachedConnector>,
 
     /// Prefer socket connection (defaults to `true`).
     ///
@@ -647,6 +721,11 @@ impl Opts {
     /// TCP port of mysql server (defaults to `3306`).
     pub fn tcp_port(&self) -> u16 {
         self.inner.address.get_tcp_port()
+    }
+
+    /// The resolved IPs for the mysql server, if provided.
+    pub fn resolved_ips(&self) -> &Option<Vec<IpAddr>> {
+        self.inner.address.get_resolved_ips()
     }
 
     /// User (defaults to `None`).
@@ -874,7 +953,7 @@ impl Opts {
     ///
     ///
     pub fn ssl_opts(&self) -> Option<&SslOpts> {
-        self.inner.mysql_opts.ssl_opts.as_ref()
+        self.inner.mysql_opts.ssl_opts.as_ref().map(|o| &o.ssl_opts)
     }
 
     /// Prefer socket connection (defaults to `true` **temporary `false` on Windows platform**).
@@ -1027,6 +1106,10 @@ impl Opts {
 
         out
     }
+
+    pub(crate) fn ssl_opts_and_connector(&self) -> Option<&SslOptsAndCachedConnector> {
+        self.inner.mysql_opts.ssl_opts.as_ref()
+    }
 }
 
 impl Default for MysqlOpts {
@@ -1068,6 +1151,47 @@ impl Default for MysqlOpts {
     }
 }
 
+#[derive(Clone)]
+pub(crate) struct SslOptsAndCachedConnector {
+    ssl_opts: SslOpts,
+    tls_connector: Arc<OnceCell<crate::io::TlsConnector>>,
+}
+
+impl fmt::Debug for SslOptsAndCachedConnector {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SslOptsAndCachedConnector")
+            .field("ssl_opts", &self.ssl_opts)
+            .finish()
+    }
+}
+
+impl SslOptsAndCachedConnector {
+    fn new(ssl_opts: SslOpts) -> Self {
+        Self {
+            ssl_opts,
+            tls_connector: Arc::new(OnceCell::new()),
+        }
+    }
+
+    pub(crate) fn ssl_opts(&self) -> &SslOpts {
+        &self.ssl_opts
+    }
+
+    pub(crate) async fn build_tls_connector(&self) -> Result<crate::io::TlsConnector> {
+        self.tls_connector
+            .get_or_try_init(move || self.ssl_opts.build_tls_connector())
+            .await
+            .cloned()
+    }
+}
+
+impl PartialEq for SslOptsAndCachedConnector {
+    fn eq(&self, other: &Self) -> bool {
+        self.ssl_opts == other.ssl_opts
+    }
+}
+impl Eq for SslOptsAndCachedConnector {}
+
 /// Connection pool constraints.
 ///
 /// This type stores `min` and `max` constraints for [`crate::Pool`] and ensures that `min <= max`.
@@ -1091,8 +1215,8 @@ impl PoolConstraints {
     /// assert_eq!(opts.pool_opts().constraints(), PoolConstraints::new(0, 151).unwrap());
     /// # Ok(()) }
     /// ```
-    pub fn new(min: usize, max: usize) -> Option<PoolConstraints> {
-        if min <= max {
+    pub const fn new(min: usize, max: usize) -> Option<PoolConstraints> {
+        if min <= max && max > 0 {
             Some(PoolConstraints { min, max })
         } else {
             None
@@ -1146,6 +1270,7 @@ pub struct OptsBuilder {
     opts: MysqlOpts,
     ip_or_hostname: String,
     tcp_port: u16,
+    resolved_ips: Option<Vec<IpAddr>>,
 }
 
 impl Default for OptsBuilder {
@@ -1155,6 +1280,7 @@ impl Default for OptsBuilder {
             opts: MysqlOpts::default(),
             ip_or_hostname: address.get_ip_or_hostname().into(),
             tcp_port: address.get_tcp_port(),
+            resolved_ips: None,
         }
     }
 }
@@ -1175,6 +1301,7 @@ impl OptsBuilder {
         OptsBuilder {
             tcp_port: opts.inner.address.get_tcp_port(),
             ip_or_hostname: opts.inner.address.get_ip_or_hostname().to_string(),
+            resolved_ips: opts.inner.address.get_resolved_ips().clone(),
             opts: opts.inner.mysql_opts.clone(),
         }
     }
@@ -1188,6 +1315,14 @@ impl OptsBuilder {
     /// Defines TCP port. See [`Opts::tcp_port`].
     pub fn tcp_port(mut self, tcp_port: u16) -> Self {
         self.tcp_port = tcp_port;
+        self
+    }
+
+    /// Defines already-resolved IPs to use for the connection. When provided
+    /// the connection will not perform DNS resolution and the hostname will be
+    /// used only for TLS identity verification purposes.
+    pub fn resolved_ips<T: Into<Vec<IpAddr>>>(mut self, ips: Option<T>) -> Self {
+        self.resolved_ips = ips.map(Into::into);
         self
     }
 
@@ -1265,7 +1400,7 @@ impl OptsBuilder {
 
     /// Defines SSL options. See [`Opts::ssl_opts`].
     pub fn ssl_opts<T: Into<Option<SslOpts>>>(mut self, ssl_opts: T) -> Self {
-        self.opts.ssl_opts = ssl_opts.into();
+        self.opts.ssl_opts = ssl_opts.into().map(SslOptsAndCachedConnector::new);
         self
     }
 
@@ -1292,8 +1427,7 @@ impl OptsBuilder {
     /// Note that it'll saturate to proper minimum and maximum values
     /// for this parameter (see MySql documentation).
     pub fn max_allowed_packet(mut self, max_allowed_packet: Option<usize>) -> Self {
-        self.opts.max_allowed_packet =
-            max_allowed_packet.map(|x| std::cmp::max(1024, std::cmp::min(1073741824, x)));
+        self.opts.max_allowed_packet = max_allowed_packet.map(|x| x.clamp(1024, 1073741824));
         self
     }
 
@@ -1368,7 +1502,11 @@ impl OptsBuilder {
 
 impl From<OptsBuilder> for Opts {
     fn from(builder: OptsBuilder) -> Opts {
-        let address = HostPortOrUrl::HostPort(builder.ip_or_hostname, builder.tcp_port);
+        let address = HostPortOrUrl::HostPort {
+            host: builder.ip_or_hostname,
+            port: builder.tcp_port,
+            resolved_ips: builder.resolved_ips,
+        };
         let inner_opts = InnerOpts {
             mysql_opts: builder.opts,
             address,
@@ -1557,8 +1695,10 @@ fn mysqlopts_from_url(url: &Url) -> std::result::Result<MysqlOpts, UrlError> {
     let mut pool_min = DEFAULT_POOL_CONSTRAINTS.min;
     let mut pool_max = DEFAULT_POOL_CONSTRAINTS.max;
 
+    let mut ssl_opts = None;
     let mut skip_domain_validation = false;
     let mut accept_invalid_certs = false;
+    let mut disable_built_in_roots = false;
 
     for (key, value) in query_pairs {
         if key == "pool_min" {
@@ -1659,10 +1799,7 @@ fn mysqlopts_from_url(url: &Url) -> std::result::Result<MysqlOpts, UrlError> {
             }
         } else if key == "max_allowed_packet" {
             match usize::from_str(&value) {
-                Ok(value) => {
-                    opts.max_allowed_packet =
-                        Some(std::cmp::max(1024, std::cmp::min(1073741824, value)))
-                }
+                Ok(value) => opts.max_allowed_packet = Some(value.clamp(1024, 1073741824)),
                 _ => {
                     return Err(UrlError::InvalidParamValue {
                         param: "max_allowed_packet".into(),
@@ -1782,7 +1919,9 @@ fn mysqlopts_from_url(url: &Url) -> std::result::Result<MysqlOpts, UrlError> {
             }
         } else if key == "require_ssl" {
             match bool::from_str(&value) {
-                Ok(x) => opts.ssl_opts = x.then(SslOpts::default),
+                Ok(x) => {
+                    ssl_opts = x.then(SslOpts::default);
+                }
                 _ => {
                     return Err(UrlError::InvalidParamValue {
                         param: "require_ssl".into(),
@@ -1814,6 +1953,18 @@ fn mysqlopts_from_url(url: &Url) -> std::result::Result<MysqlOpts, UrlError> {
                     });
                 }
             }
+        } else if key == "built_in_roots" {
+            match bool::from_str(&value) {
+                Ok(x) => {
+                    disable_built_in_roots = !x;
+                }
+                _ => {
+                    return Err(UrlError::InvalidParamValue {
+                        param: "built_in_roots".into(),
+                        value,
+                    });
+                }
+            }
         } else {
             return Err(UrlError::UnknownParameter { param: key });
         }
@@ -1828,10 +1979,13 @@ fn mysqlopts_from_url(url: &Url) -> std::result::Result<MysqlOpts, UrlError> {
         });
     }
 
-    if let Some(ref mut ssl_opts) = opts.ssl_opts.as_mut() {
+    if let Some(ref mut ssl_opts) = ssl_opts {
         ssl_opts.accept_invalid_certs = accept_invalid_certs;
         ssl_opts.skip_domain_validation = skip_domain_validation;
+        ssl_opts.disable_built_in_roots = disable_built_in_roots;
     }
+
+    opts.ssl_opts = ssl_opts.map(SslOptsAndCachedConnector::new);
 
     Ok(opts)
 }
@@ -1844,7 +1998,7 @@ impl FromStr for Opts {
     }
 }
 
-impl<'a> TryFrom<&'a str> for Opts {
+impl TryFrom<&str> for Opts {
     type Error = UrlError;
 
     fn try_from(s: &str) -> std::result::Result<Self, UrlError> {
@@ -1857,7 +2011,7 @@ mod test {
     use super::{HostPortOrUrl, MysqlOpts, Opts, Url};
     use crate::{error::UrlError::InvalidParamValue, SslOpts};
 
-    use std::str::FromStr;
+    use std::{net::IpAddr, net::Ipv4Addr, net::Ipv6Addr, str::FromStr};
 
     #[test]
     fn test_builder_eq_url() {
@@ -1904,13 +2058,15 @@ mod test {
 
     #[test]
     fn should_convert_url_into_opts() {
-        let url = "mysql://usr:pw@192.168.1.1:3309/dbname";
-        let parsed_url = Url::parse("mysql://usr:pw@192.168.1.1:3309/dbname").unwrap();
+        let url = "mysql://usr:pw@192.168.1.1:3309/dbname?prefer_socket=true";
+        let parsed_url =
+            Url::parse("mysql://usr:pw@192.168.1.1:3309/dbname?prefer_socket=true").unwrap();
 
         let mysql_opts = MysqlOpts {
             user: Some("usr".to_string()),
             pass: Some("pw".to_string()),
             db_name: Some("dbname".to_string()),
+            prefer_socket: true,
             ..MysqlOpts::default()
         };
         let host = HostPortOrUrl::Url(parsed_url);
@@ -1948,7 +2104,7 @@ mod test {
         );
 
         const URL4: &str =
-            "mysql://localhost/foo?require_ssl=true&verify_ca=false&verify_identity=false";
+            "mysql://localhost/foo?require_ssl=true&verify_ca=false&verify_identity=false&built_in_roots=false";
         let opts = Opts::from_url(URL4).unwrap();
         assert_eq!(
             opts.ssl_opts(),
@@ -1956,6 +2112,7 @@ mod test {
                 &SslOpts::default()
                     .with_danger_accept_invalid_certs(true)
                     .with_danger_skip_domain_validation(true)
+                    .with_disable_built_in_roots(true)
             )
         );
 
@@ -2037,5 +2194,45 @@ mod test {
         let url: &str = "mysql://iq-controller@localhost/";
         let url_opts = super::Opts::from_str(url).unwrap();
         assert_eq!(url_opts.db_name(), builder_opts.db_name());
+    }
+
+    #[test]
+    fn test_builder_update_port_host_resolved_ips() {
+        let builder = super::OptsBuilder::default()
+            .ip_or_hostname("foo")
+            .tcp_port(33306);
+
+        let resolved = vec![
+            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 7)),
+            IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0xc00a, 0x2ff)),
+        ];
+        let builder2 = builder
+            .clone()
+            .tcp_port(55223)
+            .resolved_ips(Some(resolved.clone()));
+
+        let builder_opts = Opts::from(builder);
+        assert_eq!(builder_opts.ip_or_hostname(), "foo");
+        assert_eq!(builder_opts.tcp_port(), 33306);
+        assert_eq!(
+            builder_opts.hostport_or_url(),
+            &HostPortOrUrl::HostPort {
+                host: "foo".to_string(),
+                port: 33306,
+                resolved_ips: None
+            }
+        );
+
+        let builder_opts2 = Opts::from(builder2);
+        assert_eq!(builder_opts2.ip_or_hostname(), "foo");
+        assert_eq!(builder_opts2.tcp_port(), 55223);
+        assert_eq!(
+            builder_opts2.hostport_or_url(),
+            &HostPortOrUrl::HostPort {
+                host: "foo".to_string(),
+                port: 55223,
+                resolved_ips: Some(resolved),
+            }
+        );
     }
 }

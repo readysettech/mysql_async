@@ -19,8 +19,10 @@
 //!
 //! # Crate Features
 //!
-//! Default feature set is wide – it includes all default [`mysql_common` features][myslqcommonfeatures]
-//! as well as `native-tls`-based TLS support.
+//! By default there are only two features enabled:
+//!
+//! *   `flate2/zlib` — choosing flate2 backend is mandatory
+//! *   `derive` — see ["Derive Macros" section in `mysql_common` docs][mysqlcommonderive]
 //!
 //! ## List Of Features
 //!
@@ -36,26 +38,18 @@
 //!     mysql_async = { version = "*", default-features = false, features = ["minimal"]}
 //!     ```
 //!
-//!     **Note:* it is possible to use another `flate2` backend by directly choosing it:
+//! *   `minimal-rust` - same as `minimal` but with rust-based flate2 backend. Enables:
 //!
-//!     ```toml
-//!     [dependencies]
-//!     mysql_async = { version = "*", default-features = false }
-//!     flate2 = { version = "*", default-features = false, features = ["rust_backend"] }
-//!     ```
+//!     -    `flate2/rust_backend`
 //!
-//! *   `default` – enables the following set of crate's and dependencies' features:
+//! *   `default` – enables the following set of features:
 //!
-//!     -   `native-tls-tls`
-//!     -   `flate2/zlib"
-//!     -   `mysql_common/bigdecimal03`
-//!     -   `mysql_common/rust_decimal`
-//!     -   `mysql_common/time03`
-//!     -   `mysql_common/uuid`
-//!     -   `mysql_common/frunk`
-//!     -   `binlog`
+//!     -   `flate2/zlib`
+//!     -   `derive`
 //!
-//! *   `default-rustls` – same as default but with `rustls-tls` instead of `native-tls-tls`.
+//! *   `default-rustls` – default set of features with TLS via `rustls/aws-lc-rs`
+//!
+//! *   `default-rustls-ring` – default set of features with TLS via `rustls/ring`
 //!
 //!     **Example:**
 //!
@@ -64,21 +58,22 @@
 //!     mysql_async = { version = "*", default-features = false, features = ["default-rustls"] }
 //!     ```
 //!
-//! *   `native-tls-tls` – enables `native-tls`-based TLS support _(conflicts with `rustls-tls`)_
+//! *   `native-tls-tls` – enables TLS via `native-tls`
 //!
 //!     **Example:**
 //!
 //!     ```toml
 //!     [dependencies]
-//!     mysql_async = { version = "*", default-features = false, features = ["native-tls-tls"] }
+//!     mysql_async = { version = "*", default-features = false, features = ["minimal", "native-tls-tls"] }
 //!
-//! *   `rustls-tls` – enables `native-tls`-based TLS support _(conflicts with `native-tls-tls`)_
+//! *   `rustls-tls` - enables rustls TLS backend with no provider. You should enable one
+//!     of existing providers using `aws-lc-rs` or `ring` features:
 //!
 //!     **Example:**
 //!
 //!     ```toml
 //!     [dependencies]
-//!     mysql_async = { version = "*", default-features = false, features = ["rustls-tls"] }
+//!     mysql_async = { version = "*", default-features = false, features = ["minimal-rust", "rustls-tls", "ring"] }
 //!
 //! *   `tracing` – enables instrumentation via `tracing` package.
 //!
@@ -94,13 +89,21 @@
 //!     mysql_async = { version = "*", features = ["tracing"] }
 //!     ```
 //!
-//! *   `derive` – enables `mysql_commom/derive` feature
-//!
 //! *   `binlog` - enables binlog-related functionality. Enables:
 //!
 //!     -   `mysql_common/binlog"
 //!
+//! ### Proxied features (see [`mysql_common`` fatures][myslqcommonfeatures])
+//!
+//! *   `derive` – enables `mysql_common/derive` feature
+//! *   `chrono` = enables `mysql_common/chrono` feature
+//! *   `time` = enables `mysql_common/time` feature
+//! *   `bigdecimal` = enables `mysql_common/bigdecimal` feature
+//! *   `rust_decimal` = enables `mysql_common/rust_decimal` feature
+//! *   `frunk` = enables `mysql_common/frunk` feature
+//!
 //! [myslqcommonfeatures]: https://github.com/blackbeam/rust_mysql_common#crate-features
+//! [mysqlcommonderive]: https://github.com/blackbeam/rust_mysql_common?tab=readme-ov-file#derive-macros
 //!
 //! # TLS/SSL Support
 //!
@@ -452,8 +455,11 @@ mod queryable;
 type BoxFuture<'a, T> = futures_core::future::BoxFuture<'a, Result<T>>;
 
 thread_local! {
-    static BUFFER_POOL: once_cell::sync::Lazy<Arc<crate::buffer_pool::BufferPool>> =
-        once_cell::sync::Lazy::new(Default::default);
+    static BUFFER_POOL: std::sync::OnceLock<Arc<crate::buffer_pool::BufferPool>> =
+         std::sync::OnceLock::new();
+}
+fn buffer_pool() -> Arc<crate::buffer_pool::BufferPool> {
+    BUFFER_POOL.with(|pool| pool.get_or_init(Default::default).clone())
 }
 
 #[cfg(feature = "binlog")]
@@ -466,10 +472,13 @@ pub use self::conn::Conn;
 #[doc(inline)]
 pub use self::conn::pool::Pool;
 
+#[cfg(any(feature = "native-tls-tls", feature = "rustls-tls"))]
+#[doc(inline)]
+pub use self::error::tls::TlsError;
+
 #[doc(inline)]
 pub use self::error::{
-    tls::TlsError, DriverError, Error, IoError, LocalInfileError, ParseError, Result, ServerError,
-    UrlError,
+    DriverError, Error, IoError, LocalInfileError, ParseError, Result, ServerError, UrlError,
 };
 
 #[doc(inline)]
@@ -479,7 +488,7 @@ pub use self::query::QueryWithParams;
 pub use self::queryable::transaction::IsolationLevel;
 
 #[doc(inline)]
-#[cfg(any(feature = "rustls", feature = "native-tls"))]
+#[cfg(any(feature = "rustls", feature = "native-tls-tls"))]
 pub use self::opts::ClientIdentity;
 
 #[doc(inline)]
@@ -543,6 +552,12 @@ pub use self::queryable::{BinaryProtocol, TextProtocol};
 #[doc(inline)]
 pub use self::queryable::stmt::Statement;
 
+#[doc(inline)]
+pub use self::conn::pool::Metrics;
+
+#[doc(inline)]
+pub use crate::connection_like::{Connection, ToConnectionResult};
+
 /// Futures used in this crate
 pub mod futures {
     pub use crate::conn::pool::futures::{DisconnectPool, GetConn};
@@ -551,6 +566,8 @@ pub mod futures {
 /// Traits used in this crate
 pub mod prelude {
     #[doc(inline)]
+    pub use crate::connection_like::ToConnection;
+    #[doc(inline)]
     pub use crate::local_infile_handler::GlobalHandler;
     #[doc(inline)]
     pub use crate::query::AsQuery;
@@ -558,6 +575,8 @@ pub mod prelude {
     pub use crate::query::{BatchQuery, Query, WithParams};
     #[doc(inline)]
     pub use crate::queryable::Queryable;
+    #[doc(inline)]
+    pub use mysql_common::prelude::ColumnIndex;
     #[doc(inline)]
     pub use mysql_common::prelude::FromRow;
     #[doc(inline)]
@@ -584,17 +603,6 @@ pub mod prelude {
     pub trait StatementLike: crate::queryable::stmt::StatementLike {}
     impl<T: crate::queryable::stmt::StatementLike> StatementLike for T {}
 
-    /// Everything that is a connection.
-    ///
-    /// Note that you could obtain a `'static` connection by giving away `Conn` or `Pool`.
-    pub trait ToConnection<'a, 't: 'a>: crate::connection_like::ToConnection<'a, 't> {}
-    // explicitly implemented because of rusdoc
-    impl<'a> ToConnection<'a, 'static> for &'a crate::Pool {}
-    impl ToConnection<'static, 'static> for crate::Pool {}
-    impl ToConnection<'static, 'static> for crate::Conn {}
-    impl<'a> ToConnection<'a, 'static> for &'a mut crate::Conn {}
-    impl<'a, 't> ToConnection<'a, 't> for &'a mut crate::Transaction<'t> {}
-
     /// Trait for protocol markers [`crate::TextProtocol`] and [`crate::BinaryProtocol`].
     pub trait Protocol: crate::queryable::Protocol {}
     impl Protocol for crate::BinaryProtocol {}
@@ -605,9 +613,8 @@ pub mod prelude {
 
 #[doc(hidden)]
 pub mod test_misc {
-    use lazy_static::lazy_static;
-
     use std::env;
+    use std::sync::OnceLock;
 
     use crate::opts::{Opts, OptsBuilder, SslOpts};
 
@@ -618,26 +625,17 @@ pub mod test_misc {
         _dummy(err);
     }
 
-    lazy_static! {
-        pub static ref DATABASE_URL: String = {
-            if let Ok(url) = env::var("DATABASE_URL") {
-                let opts = Opts::from_url(&url).expect("DATABASE_URL invalid");
-                if opts
-                    .db_name()
-                    .expect("a database name is required")
-                    .is_empty()
-                {
-                    panic!("database name is empty");
-                }
-                url
-            } else {
-                "mysql://root:password@localhost:3307/mysql".into()
-            }
-        };
-    }
-
     pub fn get_opts() -> OptsBuilder {
-        let mut builder = OptsBuilder::from_opts(Opts::from_url(&DATABASE_URL).unwrap());
+        static DATABASE_OPTS: OnceLock<Opts> = OnceLock::new();
+        let database_opts = DATABASE_OPTS.get_or_init(|| {
+            if let Ok(url) = env::var("DATABASE_URL") {
+                Opts::from_url(&url).expect("DATABASE_URL invalid")
+            } else {
+                Opts::from_url("mysql://root:password@localhost:3307/mysql").unwrap()
+            }
+        });
+
+        let mut builder = OptsBuilder::from_opts(database_opts.clone());
         if test_ssl() {
             let ssl_opts = SslOpts::default()
                 .with_danger_skip_domain_validation(true)
