@@ -456,7 +456,7 @@ type BoxFuture<'a, T> = futures_core::future::BoxFuture<'a, Result<T>>;
 
 thread_local! {
     static BUFFER_POOL: std::sync::OnceLock<Arc<crate::buffer_pool::BufferPool>> =
-         std::sync::OnceLock::new();
+         const { std::sync::OnceLock::new() };
 }
 fn buffer_pool() -> Arc<crate::buffer_pool::BufferPool> {
     BUFFER_POOL.with(|pool| pool.get_or_init(Default::default).clone())
