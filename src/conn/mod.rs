@@ -2077,6 +2077,68 @@ mod test {
 
         Ok(())
     }
+
+    #[tokio::test]
+    async fn should_get_tagged_gtid_after_transaction() -> super::Result<()> {
+        let mut conn =
+            Conn::new(get_opts().add_capability(CapabilityFlags::CLIENT_SESSION_TRACK)).await?;
+
+        // Tagged GTIDs require MySQL >= 8.4
+        if conn.server_version() < (8, 4, 0) || conn.inner.is_mariadb {
+            eprintln!(
+                "SKIPPED: tagged GTIDs require MySQL >= 8.4 (server is {:?})",
+                conn.server_version()
+            );
+            conn.disconnect().await?;
+            return Ok(());
+        }
+
+        // Check GTID mode
+        if let Ok(Some(gtid_mode)) = "SELECT @@GLOBAL.GTID_MODE"
+            .first::<String, _>(&mut conn)
+            .await
+        {
+            if !gtid_mode.starts_with("ON") {
+                eprintln!("SKIPPED: GTID_MODE is not ON (got {gtid_mode})");
+                conn.disconnect().await?;
+                return Ok(());
+            }
+        }
+
+        // Track GTID
+        conn.query_drop("SET @@session.session_track_gtids = OWN_GTID")
+            .await?;
+
+        conn.query_drop("DROP TABLE IF EXISTS tagged_gtid_session_test")
+            .await?;
+        conn.query_drop("CREATE TABLE tagged_gtid_session_test (id INT, name TEXT)")
+            .await?;
+
+        // Use AUTOMATIC:tag to let the server assign a tagged GTID.
+        // This is required because session_track_gtids only reports
+        // server-assigned GTIDs (AUTOMATIC mode), not explicitly set ones.
+        conn.query_drop("SET GTID_NEXT='AUTOMATIC:sessiontag'")
+            .await?;
+        let mut transaction = conn.start_transaction(TxOpts::default()).await?;
+        transaction
+            .query_drop("INSERT INTO tagged_gtid_session_test VALUES (1, 'tagged')")
+            .await?;
+        let gtid = transaction.commit_returning_gtid().await?;
+
+        // The returned GTID should contain the tag
+        assert!(
+            gtid.contains("sessiontag"),
+            "Expected tagged GTID containing 'sessiontag', got: {gtid}"
+        );
+
+        conn.query_drop("SET GTID_NEXT='AUTOMATIC'").await?;
+        conn.query_drop("DROP TABLE tagged_gtid_session_test")
+            .await?;
+        conn.disconnect().await?;
+
+        Ok(())
+    }
+
     #[tokio::test]
     async fn should_run_transactions() -> super::Result<()> {
         let mut conn = Conn::new(get_opts()).await?;

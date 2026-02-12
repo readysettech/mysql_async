@@ -191,7 +191,7 @@ mod tests {
     use std::time::Duration;
 
     use futures_util::StreamExt;
-    use mysql_common::binlog::events::EventData;
+    use mysql_common::binlog::{consts::EventType, events::EventData};
     use tokio::time::timeout;
 
     use crate::prelude::*;
@@ -371,6 +371,384 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+
+        Ok(())
+    }
+
+    /// Parses GTID_EXECUTED and returns the max GNO for a given UUID and optional tag.
+    ///
+    /// Parses a GTID_EXECUTED string and returns the maximum GNO for
+    /// the given UUID and tag namespace.
+    ///
+    /// GTID_EXECUTED format: all namespaces for one UUID appear in a single
+    /// comma-separated entry. Tokens after `uuid:` are colon-separated;
+    /// a token starting with a digit is an interval, and one starting with
+    /// `[a-z_]` is a tag name for subsequent intervals.
+    ///
+    /// Examples:
+    ///   `uuid:1-58`                                — untagged intervals only
+    ///   `uuid:1-58:tag:1-5:10`                     — untagged 1-58, tag 1-5 and 10
+    ///   `uuid:1-58:t1:1-5:t2:1-3,other_uuid:1-10` — two UUIDs, mixed tagged/untagged
+    ///
+    /// When `tag` is `None`, returns the max GNO from untagged intervals.
+    /// When `tag` is `Some(t)`, returns the max GNO from intervals under that tag.
+    fn max_executed_gno(gtid_executed: &str, target_uuid: &str, tag: Option<&str>) -> u64 {
+        let mut max = 0u64;
+        for entry in gtid_executed.split(',') {
+            let entry = entry.trim();
+            if entry.is_empty() {
+                continue;
+            }
+            let parts: Vec<&str> = entry.splitn(2, ':').collect();
+            if parts.len() < 2 {
+                continue;
+            }
+            if !parts[0].trim().eq_ignore_ascii_case(target_uuid) {
+                continue;
+            }
+            // Walk the colon-separated tokens to parse interleaved tags and intervals.
+            // current_tag tracks which namespace we're in (None = untagged).
+            let mut current_tag: Option<&str> = None;
+            for token in parts[1].split(':') {
+                let first_char = token.chars().next().unwrap_or('0');
+                if first_char.is_ascii_lowercase() || first_char == '_' {
+                    // This token is a tag name; subsequent intervals belong to it.
+                    current_tag = Some(token);
+                } else {
+                    // This token is an interval (e.g. "1-58" or "10").
+                    if current_tag == tag {
+                        if let Some(end) = token.split('-').last() {
+                            if let Ok(n) = end.parse::<u64>() {
+                                max = max.max(n);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        max
+    }
+
+    /// Parses GTID_EXECUTED into a list of `Sid` for a given UUID.
+    ///
+    /// Returns one Sid per namespace (untagged + each tag) with the
+    /// correct intervals. This produces a GTID set that exactly matches
+    /// the server's state, avoiding "Replica has more GTIDs" errors
+    /// from over-claiming with a single large interval.
+    fn parse_sids_from_gtid_executed<'a>(
+        gtid_executed: &str,
+        target_uuid: &str,
+    ) -> Vec<Sid<'a>> {
+        let uuid_bytes = parse_uuid_bytes(target_uuid);
+        let mut sids = Vec::new();
+        for entry in gtid_executed.split(',') {
+            let entry = entry.trim();
+            if entry.is_empty() {
+                continue;
+            }
+            let parts: Vec<&str> = entry.splitn(2, ':').collect();
+            if parts.len() < 2 {
+                continue;
+            }
+            if !parts[0].trim().eq_ignore_ascii_case(target_uuid) {
+                continue;
+            }
+            // Walk tokens: tag names start with [a-z_], intervals start with digit.
+            let mut current_tag: Option<String> = None;
+            let mut current_intervals: Vec<GnoInterval> = Vec::new();
+
+            let flush = |tag: &Option<String>,
+                         intervals: &mut Vec<GnoInterval>,
+                         sids: &mut Vec<Sid<'a>>,
+                         uuid: [u8; 16]| {
+                if !intervals.is_empty() {
+                    let mut sid = Sid::new(uuid);
+                    if let Some(t) = tag {
+                        sid = sid.with_tag(Tag::new(t.clone()).unwrap());
+                    }
+                    for iv in intervals.drain(..) {
+                        sid = sid.with_interval(iv);
+                    }
+                    sids.push(sid);
+                }
+            };
+
+            for token in parts[1].split(':') {
+                let first_char = token.chars().next().unwrap_or('0');
+                if first_char.is_ascii_lowercase() || first_char == '_' {
+                    // Flush previous namespace
+                    flush(&current_tag, &mut current_intervals, &mut sids, uuid_bytes);
+                    current_tag = Some(token.to_owned());
+                } else {
+                    // Parse interval "start-end" or "start"
+                    let mut parts_iter = token.split('-');
+                    if let Some(start_str) = parts_iter.next() {
+                        if let Ok(start) = start_str.parse::<u64>() {
+                            let end = parts_iter
+                                .next()
+                                .and_then(|s| s.parse::<u64>().ok())
+                                .unwrap_or(start);
+                            // GnoInterval uses [start, end) convention
+                            current_intervals.push(GnoInterval::new(start, end + 1));
+                        }
+                    }
+                }
+            }
+            // Flush last namespace
+            flush(&current_tag, &mut current_intervals, &mut sids, uuid_bytes);
+        }
+        sids
+    }
+
+    fn parse_uuid_bytes(uuid_str: &str) -> [u8; 16] {
+        let hex: String = uuid_str.replace('-', "");
+        let mut bytes = [0u8; 16];
+        for (i, byte) in bytes.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).unwrap();
+        }
+        bytes
+    }
+
+    /// Generates a transaction using a tagged GTID (MySQL 8.4+).
+    ///
+    /// Executes `SET GTID_NEXT='<uuid>:<tag>:<gno>'` to assign a tagged GTID to the
+    /// transaction, then commits a simple INSERT, and resets `GTID_NEXT` to `AUTOMATIC`.
+    async fn gen_tagged_gtid_data(
+        conn: &mut Conn,
+        table: &str,
+        uuid: &str,
+        tag: &str,
+        gno: u64,
+    ) -> super::Result<()> {
+        conn.query_drop(format!("SET GTID_NEXT='{uuid}:{tag}:{gno}'"))
+            .await?;
+        conn.query_drop("BEGIN").await?;
+        conn.query_drop(format!("INSERT INTO {table} VALUES (1)"))
+            .await?;
+        conn.query_drop("COMMIT").await?;
+        conn.query_drop("SET GTID_NEXT='AUTOMATIC'").await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn should_read_tagged_gtid_from_binlog() -> super::Result<()> {
+        let mut conn = Conn::new(get_opts()).await?;
+
+        // Tagged GTIDs require MySQL >= 8.4
+        if conn.server_version() < (8, 4, 0) || conn.inner.is_mariadb {
+            eprintln!(
+                "SKIPPED: tagged GTIDs require MySQL >= 8.4 (server is {:?})",
+                conn.server_version()
+            );
+            conn.disconnect().await?;
+            return Ok(());
+        }
+
+        if let Ok(Some(gtid_mode)) = "SELECT @@GLOBAL.GTID_MODE"
+            .first::<String, _>(&mut conn)
+            .await
+        {
+            if !gtid_mode.starts_with("ON") {
+                eprintln!("SKIPPED: GTID_MODE is not ON (got {gtid_mode})");
+                conn.disconnect().await?;
+                return Ok(());
+            }
+        }
+
+        conn.query_drop("CREATE TABLE IF NOT EXISTS tagged_gtid_test (id INT NOT NULL)")
+            .await?;
+
+        let server_uuid: String =
+            "SELECT @@server_uuid".first(&mut conn).await?.unwrap();
+
+        // Find next available GNO for our tag, using only the "readtest" tag namespace
+        let gtid_executed: String = "SELECT @@GLOBAL.GTID_EXECUTED"
+            .first(&mut conn)
+            .await?
+            .unwrap();
+        let tag_gno = max_executed_gno(&gtid_executed, &server_uuid, Some("readtest")) + 1;
+
+        // Get current binlog position before our tagged transaction
+        let row: crate::Row = "SHOW BINARY LOGS".first(&mut conn).await?.unwrap();
+        let filename: Vec<u8> = row.get(0).unwrap();
+        let position: u64 = row.get(1).unwrap();
+
+        // Generate a transaction with a tagged GTID
+        gen_tagged_gtid_data(&mut conn, "tagged_gtid_test", &server_uuid, "readtest", tag_gno)
+            .await?;
+
+        // Now read the binlog stream starting from our saved position
+        let mut binlog_stream = conn
+            .get_binlog_stream(
+                BinlogStreamRequest::new(42)
+                    .with_gtid()
+                    .with_filename(&filename)
+                    .with_pos(position),
+            )
+            .await?;
+
+        let mut found_tagged_gtid = false;
+        while let Ok(Some(event)) =
+            timeout(Duration::from_secs(10), binlog_stream.next()).await
+        {
+            let event = event?;
+
+            if event.header().event_type() == Ok(EventType::GTID_TAGGED_LOG_EVENT) {
+                if let Some(EventData::GtidEvent(gtid)) = event.read_data()? {
+                    if gtid.is_tagged()
+                        && gtid.tag().map(|t| t.as_str()) == Some("readtest")
+                        && gtid.gno() == tag_gno
+                    {
+                        found_tagged_gtid = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        assert!(
+            found_tagged_gtid,
+            "GTID_TAGGED_LOG_EVENT with tag 'readtest' and gno {tag_gno} not found in binlog stream"
+        );
+
+        binlog_stream.close().await?;
+
+        // Cleanup
+        let mut conn = Conn::new(get_opts()).await?;
+        conn.query_drop("DROP TABLE IF EXISTS tagged_gtid_test")
+            .await?;
+        conn.disconnect().await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn should_replicate_with_tagged_gtid_set() -> super::Result<()> {
+        let mut conn = Conn::new(get_opts()).await?;
+
+        // Tagged GTIDs require MySQL >= 8.4
+        if conn.server_version() < (8, 4, 0) || conn.inner.is_mariadb {
+            eprintln!(
+                "SKIPPED: tagged GTIDs require MySQL >= 8.4 (server is {:?})",
+                conn.server_version()
+            );
+            conn.disconnect().await?;
+            return Ok(());
+        }
+
+        if let Ok(Some(gtid_mode)) = "SELECT @@GLOBAL.GTID_MODE"
+            .first::<String, _>(&mut conn)
+            .await
+        {
+            if !gtid_mode.starts_with("ON") {
+                eprintln!("SKIPPED: GTID_MODE is not ON (got {gtid_mode})");
+                conn.disconnect().await?;
+                return Ok(());
+            }
+        }
+
+        conn.query_drop("CREATE TABLE IF NOT EXISTS tagged_gtid_test2 (id INT NOT NULL)")
+            .await?;
+
+        let server_uuid: String =
+            "SELECT @@server_uuid".first(&mut conn).await?.unwrap();
+        let uuid_bytes = parse_uuid_bytes(&server_uuid);
+
+        // Get current GTID_EXECUTED and compute next GNOs per namespace
+        let gtid_executed: String = "SELECT @@GLOBAL.GTID_EXECUTED"
+            .first(&mut conn)
+            .await?
+            .unwrap();
+        let max_repltest = max_executed_gno(&gtid_executed, &server_uuid, Some("repltest"));
+
+        let tag_gno = max_repltest + 1;
+
+        // Generate two tagged GTID transactions
+        gen_tagged_gtid_data(
+            &mut conn, "tagged_gtid_test2", &server_uuid, "repltest", tag_gno,
+        )
+        .await?;
+        gen_tagged_gtid_data(
+            &mut conn, "tagged_gtid_test2", &server_uuid, "repltest", tag_gno + 1,
+        )
+        .await?;
+
+        // Build the exclude set from the server's actual GTID_EXECUTED.
+        // We must use the exact intervals (not a single [1, max]) because
+        // the server may have gaps, and over-claiming causes error 1236.
+        let gtid_executed_now: String = "SELECT @@GLOBAL.GTID_EXECUTED"
+            .first(&mut conn)
+            .await?
+            .unwrap();
+        let mut exclude_sids =
+            parse_sids_from_gtid_executed(&gtid_executed_now, &server_uuid);
+
+        // Remove the second tagged transaction (tag_gno + 1) from the
+        // repltest Sid so the server sends it to us. Since tag_gno+1
+        // was just appended, it will be at the end of the last interval.
+        for sid in &mut exclude_sids {
+            if sid.tag().map(|t| t.as_str()) == Some("repltest") {
+                let mut new_sid = Sid::new(uuid_bytes)
+                    .with_tag(Tag::new("repltest").unwrap());
+                for iv in sid.intervals() {
+                    let end = iv.end(); // exclusive
+                    if end == tag_gno + 2 {
+                        // This interval ends at tag_gno+1 (inclusive).
+                        // Trim to exclude tag_gno+1.
+                        if iv.start() < tag_gno + 1 {
+                            new_sid =
+                                new_sid.with_interval(GnoInterval::new(iv.start(), tag_gno + 1));
+                        }
+                        // else: interval is exactly [tag_gno+1, tag_gno+2) — skip it
+                    } else {
+                        new_sid = new_sid.with_interval(*iv);
+                    }
+                }
+                *sid = new_sid;
+                break;
+            }
+        }
+
+        let mut binlog_stream = conn
+            .get_binlog_stream(
+                BinlogStreamRequest::new(43)
+                    .with_gtid()
+                    .with_gtid_set(exclude_sids),
+            )
+            .await?;
+
+        let mut found_second_tagged = false;
+        while let Ok(Some(event)) =
+            timeout(Duration::from_secs(10), binlog_stream.next()).await
+        {
+            let event = event?;
+
+            if event.header().event_type() == Ok(EventType::GTID_TAGGED_LOG_EVENT) {
+                if let Some(EventData::GtidEvent(gtid)) = event.read_data()? {
+                    if gtid.is_tagged()
+                        && gtid.tag().map(|t| t.as_str()) == Some("repltest")
+                        && gtid.gno() == tag_gno + 1
+                    {
+                        found_second_tagged = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        assert!(
+            found_second_tagged,
+            "Expected tagged GTID repltest:{} in binlog stream",
+            tag_gno + 1,
+        );
+
+        binlog_stream.close().await?;
+
+        // Cleanup
+        let mut conn = Conn::new(get_opts()).await?;
+        conn.query_drop("DROP TABLE IF EXISTS tagged_gtid_test2")
+            .await?;
+        conn.disconnect().await?;
 
         Ok(())
     }
