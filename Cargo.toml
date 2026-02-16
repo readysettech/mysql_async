@@ -115,6 +115,7 @@ bigdecimal = ["mysql_common/bigdecimal"]
 rust_decimal = ["mysql_common/rust_decimal"]
 frunk = ["mysql_common/frunk"]
 client_ed25519 = ["mysql_common/client_ed25519"]
+client_parsec = ["mysql_common/client_parsec"]
 
 # other features
 tracing = ["dep:tracing"]
