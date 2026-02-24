@@ -127,3 +127,6 @@ path = "src/lib.rs"
 
 [profile.bench]
 debug = true
+
+[patch.crates-io]
+mysql_common = { git = "https://github.com/blackbeam/rust_mysql_common", branch = "master" }
