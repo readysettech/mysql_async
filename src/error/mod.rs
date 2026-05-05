@@ -11,8 +11,11 @@ pub use url::ParseError;
 pub mod tls;
 
 use mysql_common::{
-    named_params::MixedParamsError, params::MissingNamedParameterError,
-    proto::codec::error::PacketCodecError, row::Row, value::Value,
+    named_params::MixedParamsError,
+    params::{MissingNamedParameterError, ParamsError},
+    proto::codec::error::PacketCodecError,
+    row::Row,
+    value::Value,
 };
 use thiserror::Error;
 
@@ -177,6 +180,8 @@ pub enum DriverError {
 
     #[error("mysql_clear_password must be enabled on the client side")]
     CleartextPluginDisabled,
+    #[error("Invalid parsec ext-salt packet received from server")]
+    InvalidParsecSalt,
 }
 
 #[derive(Debug, Error)]
@@ -296,6 +301,15 @@ impl From<MixedParamsError> for DriverError {
 impl From<MixedParamsError> for Error {
     fn from(err: MixedParamsError) -> Self {
         Error::Driver(err.into())
+    }
+}
+
+impl From<ParamsError> for Error {
+    fn from(err: ParamsError) -> Self {
+        match err {
+            ParamsError::Missing(e) => e.into(),
+            ParamsError::Confusion(_) => Error::Driver(DriverError::NamedParamsForPositionalQuery),
+        }
     }
 }
 

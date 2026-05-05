@@ -507,7 +507,7 @@ pub use mysql_common::packets::{
         Gtids, Schema, SessionStateChange, SystemVariable, TransactionCharacteristics,
         TransactionState, Unsupported,
     },
-    Column, GnoInterval, OkPacket, SessionStateInfo, Sid,
+    Column, GnoInterval, InvalidTag, OkPacket, SessionStateInfo, Sid, Tag,
 };
 
 #[cfg(feature = "binlog")]
