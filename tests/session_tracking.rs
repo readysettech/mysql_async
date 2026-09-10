@@ -121,16 +121,32 @@ async fn reset_setup_restores_mode_and_keeps_connection_usable() {
 
 #[tokio::test]
 async fn setup_error_does_not_desynchronize_following_queries() {
-    let mut conn = Conn::new(get_opts()).await.unwrap();
-    assert!(conn
-        .reset_with_setup("SET sql_mode='INVALID_MODE'")
-        .await
-        .is_err());
-    assert_eq!(
-        conn.query_first::<u8, _>("SELECT 1").await.unwrap(),
-        Some(1)
-    );
-    conn.disconnect().await.unwrap();
+    for compression in [None, Some(mysql_async::Compression::default())] {
+        let mut conn = Conn::new(get_opts().compression(compression))
+            .await
+            .unwrap();
+        let before = conn.prep("SELECT ? AS n").await.unwrap();
+        assert_eq!(
+            conn.exec_first::<u8, _, _>(&before, (42,)).await.unwrap(),
+            Some(42)
+        );
+        assert!(conn
+            .reset_with_setup("SET sql_mode='INVALID_MODE'")
+            .await
+            .is_err());
+        assert_eq!(
+            conn.query_first::<u8, _>("SELECT 1").await.unwrap(),
+            Some(1)
+        );
+        // Reset deleted the server statement. Re-preparing identical SQL must
+        // bypass the old cache entry even though the following setup failed.
+        let after = conn.prep("SELECT ? AS n").await.unwrap();
+        assert_eq!(
+            conn.exec_first::<u8, _, _>(&after, (43,)).await.unwrap(),
+            Some(43)
+        );
+        conn.disconnect().await.unwrap();
+    }
 }
 
 #[tokio::test]

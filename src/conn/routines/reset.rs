@@ -24,6 +24,7 @@ impl Routine<()> for ResetRoutine {
             conn.write_command_data(Command::COM_RESET_CONNECTION, &[])
                 .await?;
             conn.read_packet().await?;
+            conn.clear_reset_state();
             Ok(())
         };
 
@@ -62,6 +63,9 @@ impl Routine<()> for ResetSetupRoutine<'_> {
                     Ok(packet)
                 }
             });
+            if reset_result.is_ok() {
+                conn.clear_reset_state();
+            }
             conn.stream_mut()?.resume_setup_response(codec);
             let setup_packet = conn.read_packet().await?;
             if setup_packet.first() != Some(&0) || conn.more_results_exists() {

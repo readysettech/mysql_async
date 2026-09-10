@@ -1307,6 +1307,12 @@ impl Conn {
         self.reset_inner(Some(setup)).await
     }
 
+    // Called when the server acknowledges reset, even if later setup fails.
+    fn clear_reset_state(&mut self) {
+        self.inner.stmt_cache.clear();
+        self.inner.infile_handler = None;
+    }
+
     async fn reset_inner(&mut self, setup: Option<&str>) -> Result<bool> {
         let supports_com_reset_connection = if self.inner.is_mariadb {
             self.inner.version >= (10, 2, 4)
@@ -1328,8 +1334,6 @@ impl Conn {
                     }
                 }
             }
-            self.inner.stmt_cache.clear();
-            self.inner.infile_handler = None;
             self.run_setup_commands().await?;
         }
 
