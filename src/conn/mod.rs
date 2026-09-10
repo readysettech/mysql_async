@@ -94,6 +94,8 @@ pub(crate) enum PendingResult {
     Taken(Arc<ResultSetMeta>),
 }
 
+type SessionObserver = Arc<dyn Fn(Option<&OkPacket<'static>>) + Send + Sync>;
+
 /// Mysql connection
 struct ConnInner {
     stream: Option<Stream>,
@@ -105,6 +107,7 @@ struct ConnInner {
     mariadb_capabilities: MariadbCapabilities,
     status: StatusFlags,
     last_ok_packet: Option<OkPacket<'static>>,
+    session_observer: Option<SessionObserver>,
     last_err_packet: Option<mysql_common::packets::ServerError<'static>>,
     handshake_complete: bool,
     pool: Option<Pool>,
@@ -155,6 +158,7 @@ impl ConnInner {
             mariadb_capabilities: MariadbCapabilities::empty(),
             status: StatusFlags::empty(),
             last_ok_packet: None,
+            session_observer: None,
             last_err_packet: None,
             handshake_complete: false,
             stream: None,
@@ -321,8 +325,30 @@ impl Conn {
         }
     }
 
+    /// Observe every OK packet in receive order, including intermediate results.
+    ///
+    /// `None` invalidates observations on errors, reset, or change-user. The callback
+    /// must return promptly and must not re-enter this connection. Install it before
+    /// executing session initialization. Enable `OptsBuilder::add_capability`
+    /// with `CLIENT_SESSION_TRACK` before connecting to receive system variable values.
+    pub fn set_session_observer<F>(&mut self, observer: F)
+    where
+        F: Fn(Option<&OkPacket<'static>>) + Send + Sync + 'static,
+    {
+        self.inner.session_observer = Some(Arc::new(observer));
+    }
+
+    fn invalidate_session_observations(&self) {
+        if let Some(observer) = &self.inner.session_observer {
+            observer(None);
+        }
+    }
+
     /// Handles OK packet.
     pub(crate) fn handle_ok(&mut self, ok_packet: OkPacket<'static>) {
+        if let Some(observer) = &self.inner.session_observer {
+            observer(Some(&ok_packet));
+        }
         self.inner.status = ok_packet.status_flags();
         self.inner.last_err_packet = None;
         self.inner.last_ok_packet = Some(ok_packet);
@@ -332,6 +358,7 @@ impl Conn {
     pub(crate) fn handle_err(&mut self, err_packet: ErrPacket<'_>) -> Result<()> {
         match err_packet {
             ErrPacket::Error(err) => {
+                self.invalidate_session_observations();
                 self.inner.status = StatusFlags::empty();
                 self.inner.last_ok_packet = None;
                 self.inner.last_err_packet = Some(err.clone().into_owned());
@@ -890,7 +917,12 @@ impl Conn {
     }
 
     /// Returns `true` for ProgressReport packet.
-    fn handle_packet(&mut self, packet: &PooledBuf) -> Result<bool> {
+    fn handle_packet(&mut self, packet: &PooledBuf, prepare_header: bool) -> Result<bool> {
+        // COM_STMT_PREPARE_OK starts with 0x00 but contains a statement id,
+        // not affected rows or session status. The prepare routine validates it.
+        if prepare_header && packet.first() == Some(&0) {
+            return Ok(false);
+        }
         let ok_packet = if self.has_pending_result() {
             if self.has_capabilities(CapabilityFlags::CLIENT_DEPRECATE_EOF) {
                 ParseBuf(packet)
@@ -933,6 +965,14 @@ impl Conn {
     }
 
     pub async fn read_packet(&mut self) -> Result<PooledBuf> {
+        self.read_packet_inner(false).await
+    }
+
+    pub(crate) async fn read_prepare_response(&mut self) -> Result<PooledBuf> {
+        self.read_packet_inner(true).await
+    }
+
+    async fn read_packet_inner(&mut self, prepare_header: bool) -> Result<PooledBuf> {
         loop {
             let packet = crate::io::ReadPacket::new(&mut *self)
                 .await
@@ -941,7 +981,7 @@ impl Conn {
                     self.inner.disconnected = true;
                     Error::from(io_err)
                 })?;
-            if self.handle_packet(&packet)? {
+            if self.handle_packet(&packet, prepare_header)? {
                 // ignore progress report
                 continue;
             } else {
@@ -1254,6 +1294,20 @@ impl Conn {
     ///
     /// [1]: https://dev.mysql.com/doc/c-api/5.7/en/mysql-reset-connection.html
     pub async fn reset(&mut self) -> Result<bool> {
+        self.reset_inner(None).await
+    }
+
+    /// Reset and execute one initialization statement returning a single OK packet.
+    ///
+    /// The uncompressed protocol sends both commands before reading either response.
+    /// TLS is supported. Compressed connections execute the commands sequentially.
+    /// Result-producing or multiple initialization statements close the connection.
+    /// Configured setup commands still run afterward, as in `reset`.
+    pub async fn reset_with_setup(&mut self, setup: &str) -> Result<bool> {
+        self.reset_inner(Some(setup)).await
+    }
+
+    async fn reset_inner(&mut self, setup: Option<&str>) -> Result<bool> {
         let supports_com_reset_connection = if self.inner.is_mariadb {
             self.inner.version >= (10, 2, 4)
         } else {
@@ -1262,7 +1316,18 @@ impl Conn {
         };
 
         if supports_com_reset_connection {
-            self.routine(routines::ResetRoutine).await?;
+            self.invalidate_session_observations();
+            match setup {
+                Some(sql) if self.opts().compression().is_none() => {
+                    self.routine(routines::ResetSetupRoutine(sql)).await?;
+                }
+                _ => {
+                    self.routine(routines::ResetRoutine).await?;
+                    if let Some(sql) = setup {
+                        self.query_drop(sql).await?;
+                    }
+                }
+            }
             self.inner.stmt_cache.clear();
             self.inner.infile_handler = None;
             self.run_setup_commands().await?;
@@ -1283,6 +1348,7 @@ impl Conn {
     ///
     /// [1]: https://dev.mysql.com/doc/c-api/5.7/en/mysql-change-user.html
     pub async fn change_user(&mut self, opts: ChangeUserOpts) -> Result<()> {
+        self.invalidate_session_observations();
         // We'll kick this connection from a pool if opts are changed.
         if opts != ChangeUserOpts::default() {
             let mut opts_changed = false;

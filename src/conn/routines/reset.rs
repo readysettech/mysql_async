@@ -33,3 +33,48 @@ impl Routine<()> for ResetRoutine {
         fut.boxed()
     }
 }
+
+/// Reset followed by one OK-producing initialization statement.
+#[derive(Debug)]
+pub struct ResetSetupRoutine<'a>(pub &'a str);
+
+impl Routine<()> for ResetSetupRoutine<'_> {
+    fn call<'a>(self, conn: &'a mut Conn) -> BoxFuture<'a, crate::Result<()>>
+    where
+        Self: 'a,
+    {
+        async move {
+            conn.clean_dirty().await?;
+            let codec = conn.stream_mut()?.write_reset_and_setup(self.0).await?;
+            let reset_result = conn.read_packet().await;
+            if let Err(error) = &reset_result {
+                if !matches!(error, crate::Error::Server(_)) {
+                    return reset_result.map(|_| ());
+                }
+            }
+            let reset_result = reset_result.and_then(|packet| {
+                if packet.first() != Some(&0) || conn.more_results_exists() {
+                    Err(crate::DriverError::UnexpectedPacket {
+                        payload: packet.to_vec(),
+                    }
+                    .into())
+                } else {
+                    Ok(packet)
+                }
+            });
+            conn.stream_mut()?.resume_setup_response(codec);
+            let setup_packet = conn.read_packet().await?;
+            if setup_packet.first() != Some(&0) || conn.more_results_exists() {
+                return Err(crate::DriverError::UnexpectedPacket {
+                    payload: setup_packet.to_vec(),
+                }
+                .into());
+            }
+            if reset_result.is_err() {
+                conn.invalidate_session_observations();
+            }
+            reset_result.map(|_| ())
+        }
+        .boxed()
+    }
+}
