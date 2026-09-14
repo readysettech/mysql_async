@@ -128,7 +128,7 @@ pub struct Inner {
 /// inside a pooled connection is bound to the I/O driver of the runtime that established it;
 /// connections become invalid when that runtime shuts down. This is most likely to surface
 /// during graceful shutdown, when some runtimes exit before others while pooled connections
-/// are still in circulation. The pool's background tasks ([`Recycler`], TTL interval) are
+/// are still in circulation. The pool's background tasks (recycler, TTL interval) are
 /// also spawned on the first runtime to call [`Pool::get_conn`] and do not survive that
 /// runtime's shutdown.
 ///
@@ -363,6 +363,9 @@ impl Pool {
 impl Drop for Conn {
     fn drop(&mut self) {
         self.inner.infile_handler = None;
+        // A pool checkout owns its callback; recycling must not notify that caller
+        // or retain its captured state for the next borrower.
+        self.clear_session_observer();
 
         if std::thread::panicking() {
             // Try to decrease the number of existing connections.

@@ -59,6 +59,8 @@ pub mod routines;
 pub mod stmt_cache;
 
 const DEFAULT_WAIT_TIMEOUT: usize = 28800;
+// Keep reset/setup exchanges small: the pipeline flushes both commands before reading replies.
+const MAX_RESET_SETUP_LEN: usize = 64 * 1024;
 
 /// Helper that asynchronously disconnects the given connection on the default tokio executor.
 fn disconnect(mut conn: Conn) {
@@ -327,15 +329,30 @@ impl Conn {
 
     /// Observe every OK packet in receive order, including intermediate results.
     ///
-    /// `None` invalidates observations on errors, reset, or change-user. The callback
-    /// must return promptly and must not re-enter this connection. Install it before
-    /// executing session initialization. Enable `OptsBuilder::add_capability`
+    /// `None` invalidates observations on server ERR packets and before reset or
+    /// change-user, after any pending results have been drained. Fatal I/O/protocol
+    /// errors and cancellation do not guarantee a notification; discard external
+    /// observations when abandoning the connection.
+    ///
+    /// The observer survives explicit reset and change-user so it can observe the
+    /// new session's setup. It is removed when this `Conn` is dropped, including
+    /// return to a [`Pool`], or by [`Conn::clear_session_observer`]. Installing another
+    /// observer replaces the previous one without notifying it.
+    ///
+    /// The callback runs synchronously while reading responses. It must return
+    /// promptly, must not panic, and must not re-enter this connection. Install it
+    /// before executing session initialization. Enable `OptsBuilder::add_capability`
     /// with `CLIENT_SESSION_TRACK` before connecting to receive system variable values.
     pub fn set_session_observer<F>(&mut self, observer: F)
     where
         F: Fn(Option<&OkPacket<'static>>) + Send + Sync + 'static,
     {
         self.inner.session_observer = Some(Arc::new(observer));
+    }
+
+    /// Remove the session observer without invoking it.
+    pub fn clear_session_observer(&mut self) {
+        self.inner.session_observer = None;
     }
 
     fn invalidate_session_observations(&self) {
@@ -458,7 +475,8 @@ impl Conn {
             }
             Err(err) => {
                 if self.inner.stream.is_some() {
-                    self.take_stream().close().await?;
+                    // Cleanup failure must not hide the original protocol/I/O error.
+                    let _ = self.take_stream().close().await;
                 }
                 Err(err)
             }
@@ -1299,10 +1317,22 @@ impl Conn {
 
     /// Reset and execute one initialization statement returning a single OK packet.
     ///
+    /// Returns `false` without executing either command when the server does not
+    /// support reset, as in [`Conn::reset`].
+    ///
     /// The uncompressed protocol sends both commands before reading either response.
     /// TLS is supported. Compressed connections execute the commands sequentially.
-    /// Result-producing or multiple initialization statements close the connection.
-    /// Configured setup commands still run afterward, as in `reset`.
+    /// This is not atomic: pipelined setup may execute even if reset fails, and a
+    /// successful reset is not undone if setup fails. Result-producing or multiple
+    /// initialization statements close the connection on either transport.
+    ///
+    /// Setup is limited to 64 KiB of UTF-8 bytes. On a server supporting reset,
+    /// oversized input returns [`DriverError::PacketTooLarge`] before draining
+    /// pending results or changing the session, leaving the connection usable.
+    /// Configured setup commands still run afterward, as in [`Conn::reset`].
+    ///
+    /// If this future is cancelled after I/O starts, discard the connection rather
+    /// than attempting to continue an incomplete reset/setup exchange.
     pub async fn reset_with_setup(&mut self, setup: &str) -> Result<bool> {
         self.reset_inner(Some(setup)).await
     }
@@ -1322,17 +1352,15 @@ impl Conn {
         };
 
         if supports_com_reset_connection {
+            if setup.is_some_and(|sql| sql.len() > MAX_RESET_SETUP_LEN) {
+                return Err(DriverError::PacketTooLarge.into());
+            }
+            // Old-session packets must precede the invalidation marker.
+            self.clean_dirty().await?;
             self.invalidate_session_observations();
             match setup {
-                Some(sql) if self.opts().compression().is_none() => {
-                    self.routine(routines::ResetSetupRoutine(sql)).await?;
-                }
-                _ => {
-                    self.routine(routines::ResetRoutine).await?;
-                    if let Some(sql) = setup {
-                        self.query_drop(sql).await?;
-                    }
-                }
+                Some(sql) => self.routine(routines::ResetSetupRoutine(sql)).await?,
+                None => self.routine(routines::ResetRoutine).await?,
             }
             self.run_setup_commands().await?;
         }
@@ -1352,6 +1380,7 @@ impl Conn {
     ///
     /// [1]: https://dev.mysql.com/doc/c-api/5.7/en/mysql-change-user.html
     pub async fn change_user(&mut self, opts: ChangeUserOpts) -> Result<()> {
+        self.clean_dirty().await?;
         self.invalidate_session_observations();
         // We'll kick this connection from a pool if opts are changed.
         if opts != ChangeUserOpts::default() {

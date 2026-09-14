@@ -417,16 +417,12 @@ impl Stream {
     }
 
     /// Queue a reset and a small initialization command with separate response codecs.
-    /// The caller must have drained prior results and negotiated no compression.
+    /// The caller must have drained prior results, validated the setup length,
+    /// and negotiated no compression.
     pub(crate) async fn write_reset_and_setup(
         &mut self,
         setup: &str,
     ) -> std::result::Result<PacketCodecInner, IoError> {
-        if setup.len() > 65536 {
-            return Err(
-                io::Error::new(io::ErrorKind::InvalidInput, "reset setup exceeds 64 KiB").into(),
-            );
-        }
         let framed = self
             .codec
             .as_mut()
@@ -450,10 +446,16 @@ impl Stream {
         Ok(setup_codec)
     }
 
-    pub(crate) fn resume_setup_response(&mut self, codec: PacketCodecInner) {
-        if let Some(framed) = self.codec.as_mut() {
-            framed.codec_mut().inner = codec;
-        }
+    pub(crate) fn resume_setup_response(
+        &mut self,
+        codec: PacketCodecInner,
+    ) -> std::result::Result<(), IoError> {
+        let framed = self
+            .codec
+            .as_mut()
+            .ok_or_else(|| io::Error::new(NotConnected, "setup requires an open stream"))?;
+        framed.codec_mut().inner = codec;
+        Ok(())
     }
 
     pub(crate) fn sync_seq_id(&mut self) {
