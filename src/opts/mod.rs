@@ -1534,13 +1534,13 @@ impl OptsBuilder {
         self
     }
 
-    /// Adds capability flag. See [`Opts::capabilities`].
+    /// Adds capability flags to those requested during connection setup.
     pub fn add_capability(mut self, cap_flag: CapabilityFlags) -> Self {
         self.opts.capabilities |= cap_flag;
         self
     }
 
-    /// Removes capability flag. See [`Opts::capabilities`].
+    /// Removes flags previously added with [`OptsBuilder::add_capability`].
     pub fn remove_capability(mut self, cap_flag: CapabilityFlags) -> Self {
         self.opts.capabilities &= !cap_flag;
         self

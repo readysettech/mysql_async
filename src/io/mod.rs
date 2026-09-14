@@ -10,6 +10,7 @@ pub use self::{read_packet::ReadPacket, write_packet::WritePacket};
 
 use bytes::BytesMut;
 use futures_core::{ready, stream};
+use futures_util::SinkExt;
 use mysql_common::proto::codec::PacketCodec as PacketCodecInner;
 #[cfg(unix)]
 use tokio::io::AsyncWriteExt;
@@ -413,6 +414,48 @@ impl Stream {
         if let Some(codec) = self.codec.as_mut() {
             codec.codec_mut().reset_seq_id();
         }
+    }
+
+    /// Queue a reset and a small initialization command with separate response codecs.
+    /// The caller must have drained prior results, validated the setup length,
+    /// and negotiated no compression.
+    pub(crate) async fn write_reset_and_setup(
+        &mut self,
+        setup: &str,
+    ) -> std::result::Result<PacketCodecInner, IoError> {
+        let framed = self
+            .codec
+            .as_mut()
+            .ok_or_else(|| io::Error::new(NotConnected, "reset requires an open stream"))?;
+        framed.codec_mut().reset_seq_id();
+        let mut reset = crate::buffer_pool().get();
+        reset
+            .as_mut()
+            .push(crate::consts::Command::COM_RESET_CONNECTION as u8);
+        framed.feed(reset).await?;
+
+        let mut setup_codec = PacketCodecInner::default();
+        setup_codec.max_allowed_packet = framed.codec().max_allowed_packet;
+        let reset_codec = replace(&mut framed.codec_mut().inner, setup_codec);
+        let mut query = crate::buffer_pool().get();
+        query.as_mut().push(crate::consts::Command::COM_QUERY as u8);
+        query.as_mut().extend_from_slice(setup.as_bytes());
+        framed.feed(query).await?;
+        let setup_codec = replace(&mut framed.codec_mut().inner, reset_codec);
+        framed.flush().await?;
+        Ok(setup_codec)
+    }
+
+    pub(crate) fn resume_setup_response(
+        &mut self,
+        codec: PacketCodecInner,
+    ) -> std::result::Result<(), IoError> {
+        let framed = self
+            .codec
+            .as_mut()
+            .ok_or_else(|| io::Error::new(NotConnected, "setup requires an open stream"))?;
+        framed.codec_mut().inner = codec;
+        Ok(())
     }
 
     pub(crate) fn sync_seq_id(&mut self) {

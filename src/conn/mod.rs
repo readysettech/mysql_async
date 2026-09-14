@@ -59,6 +59,8 @@ pub mod routines;
 pub mod stmt_cache;
 
 const DEFAULT_WAIT_TIMEOUT: usize = 28800;
+// Keep reset/setup exchanges small: the pipeline flushes both commands before reading replies.
+const MAX_RESET_SETUP_LEN: usize = 64 * 1024;
 
 /// Helper that asynchronously disconnects the given connection on the default tokio executor.
 fn disconnect(mut conn: Conn) {
@@ -94,6 +96,8 @@ pub(crate) enum PendingResult {
     Taken(Arc<ResultSetMeta>),
 }
 
+type SessionObserver = Arc<dyn Fn(Option<&OkPacket<'static>>) + Send + Sync>;
+
 /// Mysql connection
 struct ConnInner {
     stream: Option<Stream>,
@@ -105,6 +109,7 @@ struct ConnInner {
     mariadb_capabilities: MariadbCapabilities,
     status: StatusFlags,
     last_ok_packet: Option<OkPacket<'static>>,
+    session_observer: Option<SessionObserver>,
     last_err_packet: Option<mysql_common::packets::ServerError<'static>>,
     handshake_complete: bool,
     pool: Option<Pool>,
@@ -155,6 +160,7 @@ impl ConnInner {
             mariadb_capabilities: MariadbCapabilities::empty(),
             status: StatusFlags::empty(),
             last_ok_packet: None,
+            session_observer: None,
             last_err_packet: None,
             handshake_complete: false,
             stream: None,
@@ -321,8 +327,45 @@ impl Conn {
         }
     }
 
+    /// Observe every OK packet in receive order, including intermediate results.
+    ///
+    /// `None` invalidates observations on server ERR packets and before reset or
+    /// change-user, after any pending results have been drained. Fatal I/O/protocol
+    /// errors and cancellation do not guarantee a notification; discard external
+    /// observations when abandoning the connection.
+    ///
+    /// The observer survives explicit reset and change-user so it can observe the
+    /// new session's setup. It is removed when this `Conn` is dropped, including
+    /// return to a [`Pool`], or by [`Conn::clear_session_observer`]. Installing another
+    /// observer replaces the previous one without notifying it.
+    ///
+    /// The callback runs synchronously while reading responses. It must return
+    /// promptly, must not panic, and must not re-enter this connection. Install it
+    /// before executing session initialization. Enable `OptsBuilder::add_capability`
+    /// with `CLIENT_SESSION_TRACK` before connecting to receive system variable values.
+    pub fn set_session_observer<F>(&mut self, observer: F)
+    where
+        F: Fn(Option<&OkPacket<'static>>) + Send + Sync + 'static,
+    {
+        self.inner.session_observer = Some(Arc::new(observer));
+    }
+
+    /// Remove the session observer without invoking it.
+    pub fn clear_session_observer(&mut self) {
+        self.inner.session_observer = None;
+    }
+
+    fn invalidate_session_observations(&self) {
+        if let Some(observer) = &self.inner.session_observer {
+            observer(None);
+        }
+    }
+
     /// Handles OK packet.
     pub(crate) fn handle_ok(&mut self, ok_packet: OkPacket<'static>) {
+        if let Some(observer) = &self.inner.session_observer {
+            observer(Some(&ok_packet));
+        }
         self.inner.status = ok_packet.status_flags();
         self.inner.last_err_packet = None;
         self.inner.last_ok_packet = Some(ok_packet);
@@ -332,6 +375,7 @@ impl Conn {
     pub(crate) fn handle_err(&mut self, err_packet: ErrPacket<'_>) -> Result<()> {
         match err_packet {
             ErrPacket::Error(err) => {
+                self.invalidate_session_observations();
                 self.inner.status = StatusFlags::empty();
                 self.inner.last_ok_packet = None;
                 self.inner.last_err_packet = Some(err.clone().into_owned());
@@ -431,7 +475,8 @@ impl Conn {
             }
             Err(err) => {
                 if self.inner.stream.is_some() {
-                    self.take_stream().close().await?;
+                    // Cleanup failure must not hide the original protocol/I/O error.
+                    let _ = self.take_stream().close().await;
                 }
                 Err(err)
             }
@@ -890,7 +935,12 @@ impl Conn {
     }
 
     /// Returns `true` for ProgressReport packet.
-    fn handle_packet(&mut self, packet: &PooledBuf) -> Result<bool> {
+    fn handle_packet(&mut self, packet: &PooledBuf, prepare_header: bool) -> Result<bool> {
+        // COM_STMT_PREPARE_OK starts with 0x00 but contains a statement id,
+        // not affected rows or session status. The prepare routine validates it.
+        if prepare_header && packet.first() == Some(&0) {
+            return Ok(false);
+        }
         let ok_packet = if self.has_pending_result() {
             if self.has_capabilities(CapabilityFlags::CLIENT_DEPRECATE_EOF) {
                 ParseBuf(packet)
@@ -933,6 +983,14 @@ impl Conn {
     }
 
     pub async fn read_packet(&mut self) -> Result<PooledBuf> {
+        self.read_packet_inner(false).await
+    }
+
+    pub(crate) async fn read_prepare_response(&mut self) -> Result<PooledBuf> {
+        self.read_packet_inner(true).await
+    }
+
+    async fn read_packet_inner(&mut self, prepare_header: bool) -> Result<PooledBuf> {
         loop {
             let packet = crate::io::ReadPacket::new(&mut *self)
                 .await
@@ -941,7 +999,7 @@ impl Conn {
                     self.inner.disconnected = true;
                     Error::from(io_err)
                 })?;
-            if self.handle_packet(&packet)? {
+            if self.handle_packet(&packet, prepare_header)? {
                 // ignore progress report
                 continue;
             } else {
@@ -1254,6 +1312,38 @@ impl Conn {
     ///
     /// [1]: https://dev.mysql.com/doc/c-api/5.7/en/mysql-reset-connection.html
     pub async fn reset(&mut self) -> Result<bool> {
+        self.reset_inner(None).await
+    }
+
+    /// Reset and execute one initialization statement returning a single OK packet.
+    ///
+    /// Returns `false` without executing either command when the server does not
+    /// support reset, as in [`Conn::reset`].
+    ///
+    /// The uncompressed protocol sends both commands before reading either response.
+    /// TLS is supported. Compressed connections execute the commands sequentially.
+    /// This is not atomic: pipelined setup may execute even if reset fails, and a
+    /// successful reset is not undone if setup fails. Result-producing or multiple
+    /// initialization statements close the connection on either transport.
+    ///
+    /// Setup is limited to 64 KiB of UTF-8 bytes. On a server supporting reset,
+    /// oversized input returns [`DriverError::PacketTooLarge`] before draining
+    /// pending results or changing the session, leaving the connection usable.
+    /// Configured setup commands still run afterward, as in [`Conn::reset`].
+    ///
+    /// If this future is cancelled after I/O starts, discard the connection rather
+    /// than attempting to continue an incomplete reset/setup exchange.
+    pub async fn reset_with_setup(&mut self, setup: &str) -> Result<bool> {
+        self.reset_inner(Some(setup)).await
+    }
+
+    // Called when the server acknowledges reset, even if later setup fails.
+    fn clear_reset_state(&mut self) {
+        self.inner.stmt_cache.clear();
+        self.inner.infile_handler = None;
+    }
+
+    async fn reset_inner(&mut self, setup: Option<&str>) -> Result<bool> {
         let supports_com_reset_connection = if self.inner.is_mariadb {
             self.inner.version >= (10, 2, 4)
         } else {
@@ -1262,9 +1352,16 @@ impl Conn {
         };
 
         if supports_com_reset_connection {
-            self.routine(routines::ResetRoutine).await?;
-            self.inner.stmt_cache.clear();
-            self.inner.infile_handler = None;
+            if setup.is_some_and(|sql| sql.len() > MAX_RESET_SETUP_LEN) {
+                return Err(DriverError::PacketTooLarge.into());
+            }
+            // Old-session packets must precede the invalidation marker.
+            self.clean_dirty().await?;
+            self.invalidate_session_observations();
+            match setup {
+                Some(sql) => self.routine(routines::ResetSetupRoutine(sql)).await?,
+                None => self.routine(routines::ResetRoutine).await?,
+            }
             self.run_setup_commands().await?;
         }
 
@@ -1283,6 +1380,8 @@ impl Conn {
     ///
     /// [1]: https://dev.mysql.com/doc/c-api/5.7/en/mysql-change-user.html
     pub async fn change_user(&mut self, opts: ChangeUserOpts) -> Result<()> {
+        self.clean_dirty().await?;
+        self.invalidate_session_observations();
         // We'll kick this connection from a pool if opts are changed.
         if opts != ChangeUserOpts::default() {
             let mut opts_changed = false;

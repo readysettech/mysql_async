@@ -49,7 +49,7 @@ impl Routine<Arc<StmtInner>> for PrepareRoutine {
             conn.write_command_data(Command::COM_STMT_PREPARE, &self.query)
                 .await?;
 
-            let packet = conn.read_packet().await?;
+            let packet = conn.read_prepare_response().await?;
             let mut inner_stmt = StmtInner::from_payload(&packet, conn.id(), self.query.clone())?;
 
             #[cfg(feature = "tracing")]
