@@ -297,6 +297,11 @@ impl Statement {
         self.inner.id()
     }
 
+    /// Warning count reported in the native COM_STMT_PREPARE_OK response.
+    pub fn warning_count(&self) -> u16 {
+        self.inner.stmt_packet.warning_count()
+    }
+
     /// MySql connection identifier.
     pub fn connection_id(&self) -> u32 {
         self.inner.connection_id()

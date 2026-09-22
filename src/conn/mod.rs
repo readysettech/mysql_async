@@ -2199,6 +2199,23 @@ mod test {
     }
 
     #[tokio::test]
+    async fn should_expose_prepare_warning_count() -> super::Result<()> {
+        let mut conn = Conn::new(get_opts()).await?;
+        let statement = conn.prep("SELECT SQL_CALC_FOUND_ROWS 1").await?;
+        let warnings: Vec<(String, u16, String)> = conn.query("SHOW WARNINGS").await?;
+        assert_eq!(usize::from(statement.warning_count()), warnings.len());
+        if !conn.inner.is_mariadb && conn.server_version() >= (8, 0, 17) {
+            assert!(warnings.iter().any(|(_, code, _)| *code == 1287));
+        }
+        conn.close(statement).await?;
+        let clean = conn.prep("SELECT 1").await?;
+        assert_eq!(clean.warning_count(), 0);
+        conn.close(clean).await?;
+        conn.disconnect().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn should_prepare_statement() -> super::Result<()> {
         let mut conn = Conn::new(get_opts()).await?;
         let stmt = conn.prep(r"SELECT ?").await?;
